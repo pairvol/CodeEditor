@@ -494,6 +494,7 @@ class EditorWindow extends Gtk.ApplicationWindow {
         this._titleLabel = new Gtk.Label({
             label: 'Native Code Editor',
             single_line_mode: true,
+            width_chars: 8,
             ellipsize: 3,
         });
         header.set_title_widget(this._titleLabel);
@@ -1536,6 +1537,7 @@ class EditorWindow extends Gtk.ApplicationWindow {
 
         tab.titleLabel = new Gtk.Label({
             xalign: 0,
+            width_chars: 8,
             max_width_chars: 24,
             ellipsize: 3,
         });
