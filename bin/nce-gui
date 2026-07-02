@@ -292,9 +292,27 @@ class EditorWindow extends Gtk.ApplicationWindow {
         this._installActions();
         this._applyCustomCss();
         this.setTheme(this._theme, false, false);
+        this._forceClose = false;
         this.connect('close-request', () => {
-            if (this._hasDirtyTabs()) {
-                this._setStatus('Save modified tabs before quitting');
+            if (!this._forceClose && this._hasDirtyTabs()) {
+                const dirtyTabs = this._dirtyTabs();
+                const msg = dirtyTabs.length === 1
+                    ? 'You have 1 tab with unsaved changes.'
+                    : `You have ${dirtyTabs.length} tabs with unsaved changes.`;
+                this._confirmSaveOnClose(msg, {
+                    onSave: () => {
+                        this._saveTabsThen(dirtyTabs, ok => {
+                            if (ok) {
+                                this._forceClose = true;
+                                this.close();
+                            }
+                        });
+                    },
+                    onDiscard: () => {
+                        this._forceClose = true;
+                        this.close();
+                    },
+                });
                 return true;
             }
             return false;
@@ -1246,6 +1264,69 @@ class EditorWindow extends Gtk.ApplicationWindow {
         return false;
     }
 
+    _dirtyTabs() {
+        const dirty = [];
+        const pages = this._notebook.get_n_pages();
+        for (let i = 0; i < pages; i++) {
+            const page = this._notebook.get_nth_page(i);
+            if (page && page._nceTab && page._nceTab.dirty)
+                dirty.push(page._nceTab);
+        }
+        return dirty;
+    }
+
+    // Saves each tab in turn, stopping (and reporting failure) if any save
+    // fails or is cancelled (e.g. the user dismisses a Save As dialog).
+    _saveTabsThen(tabs, onDone) {
+        const remaining = tabs.slice();
+        const step = () => {
+            if (remaining.length === 0) {
+                onDone(true);
+                return;
+            }
+            const tab = remaining.shift();
+            this.save(tab, ok => {
+                if (ok)
+                    step();
+                else
+                    onDone(false);
+            });
+        };
+        step();
+    }
+
+    _confirmSaveOnClose(message, {onSave, onDiscard}) {
+        const dialog = new Gtk.Dialog({
+            title: 'Save Changes?',
+            transient_for: this,
+            modal: true,
+        });
+        dialog.add_button('Cancel', Gtk.ResponseType.CANCEL);
+        const discardBtn = dialog.add_button("Don't Save", Gtk.ResponseType.REJECT);
+        discardBtn.add_css_class('destructive-action');
+        const saveBtn = dialog.add_button('Save', Gtk.ResponseType.ACCEPT);
+        saveBtn.add_css_class('suggested-action');
+        dialog.set_default_response(Gtk.ResponseType.ACCEPT);
+
+        const content = dialog.get_content_area();
+        content.margin_top = 16;
+        content.margin_bottom = 16;
+        content.margin_start = 16;
+        content.margin_end = 16;
+
+        const label = new Gtk.Label({label: message, wrap: true, xalign: 0});
+        content.append(label);
+
+        dialog.connect('response', (_dialog, response) => {
+            dialog.destroy();
+            if (response === Gtk.ResponseType.ACCEPT)
+                onSave();
+            else if (response === Gtk.ResponseType.REJECT)
+                onDiscard();
+        });
+        dialog.present();
+    }
+
     _tabName(tab) {
         if (tab.remotePath)
             return pathBasename(tab.remotePath);
@@ -1375,13 +1456,26 @@ class EditorWindow extends Gtk.ApplicationWindow {
             return;
 
         if (tab.dirty) {
-            this._setStatus(`Save ${this._tabName(tab)} before closing it`);
             const pageNum = this._pageNumForTab(tab);
             if (pageNum >= 0)
                 this._notebook.set_current_page(pageNum);
+            this._confirmSaveOnClose(
+                `"${this._tabName(tab)}" has unsaved changes.`,
+                {
+                    onSave: () => this.save(tab, ok => {
+                        if (ok)
+                            this._removeTab(tab);
+                    }),
+                    onDiscard: () => this._removeTab(tab),
+                },
+            );
             return;
         }
 
+        this._removeTab(tab);
+    }
+
+    _removeTab(tab) {
         const pageNum = this._pageNumForTab(tab);
         if (pageNum < 0)
             return;
@@ -2013,17 +2107,20 @@ class EditorWindow extends Gtk.ApplicationWindow {
         );
     }
 
-    save(tab = this._currentTab()) {
-        if (!tab)
+    save(tab = this._currentTab(), onSaved = null) {
+        if (!tab) {
+            if (onSaved)
+                onSaved(false);
             return;
+        }
 
         if (tab.remotePath) {
-            this.saveRemote(tab);
+            this.saveRemote(tab, onSaved);
             return;
         }
 
         if (!tab.file) {
-            this.saveAsDialog(tab);
+            this.saveAsDialog(tab, onSaved);
             return;
         }
 
@@ -2042,14 +2139,21 @@ class EditorWindow extends Gtk.ApplicationWindow {
             this._setStatus(`Saved ${tab.file.get_parse_name()}`);
             if (this._previewButton && this._previewButton.active && this._currentTab() === tab)
                 this._updatePreviewVisibility();
+            if (onSaved)
+                onSaved(true);
         } catch (error) {
             this._setStatus(`Save failed: ${error.message}`);
+            if (onSaved)
+                onSaved(false);
         }
     }
 
-    saveRemote(tab = this._currentTab()) {
-        if (!tab || !tab.remotePath || !tab.remote)
+    saveRemote(tab = this._currentTab(), onSaved = null) {
+        if (!tab || !tab.remotePath || !tab.remote) {
+            if (onSaved)
+                onSaved(false);
             return;
+        }
 
         const tmpPath = GLib.build_filenamev([
             GLib.get_tmp_dir(),
@@ -2080,13 +2184,19 @@ class EditorWindow extends Gtk.ApplicationWindow {
                         this._setStatus(`Saved ${this._tabLocation(tab)}`);
                         if (this._previewButton && this._previewButton.active && this._currentTab() === tab)
                             this._updatePreviewVisibility();
+                        if (onSaved)
+                            onSaved(true);
                     } else {
                         this._setStatus(`SSH save failed: ${stderr.trim() || stdout.trim() || `exit ${status}`}`);
+                        if (onSaved)
+                            onSaved(false);
                     }
                 }
             );
         } catch (error) {
             this._setStatus(`SSH save failed: ${error.message}`);
+            if (onSaved)
+                onSaved(false);
         }
     }
 
@@ -2442,12 +2552,15 @@ class EditorWindow extends Gtk.ApplicationWindow {
         entry.grab_focus();
     }
 
-    saveAsDialog(tab = this._currentTab()) {
-        if (!tab)
+    saveAsDialog(tab = this._currentTab(), onSaved = null) {
+        if (!tab) {
+            if (onSaved)
+                onSaved(false);
             return;
+        }
 
         if (tab.remotePath) {
-            this.saveRemoteAsDialog(tab);
+            this.saveRemoteAsDialog(tab, onSaved);
             return;
         }
 
@@ -2467,17 +2580,22 @@ class EditorWindow extends Gtk.ApplicationWindow {
                 this._applyLanguageForTab(tab);
                 this._applySourceSchemeForTab(tab);
                 this._updateTabLabel(tab);
-                this.save(tab);
+                this.save(tab, onSaved);
                 this._updatePreviewVisibility();
+            } else if (onSaved) {
+                onSaved(false);
             }
             dialog.destroy();
         });
         dialog.show();
     }
 
-    saveRemoteAsDialog(tab = this._currentTab()) {
-        if (!tab || !tab.remotePath)
+    saveRemoteAsDialog(tab = this._currentTab(), onSaved = null) {
+        if (!tab || !tab.remotePath) {
+            if (onSaved)
+                onSaved(false);
             return;
+        }
 
         const dialog = new Gtk.Dialog({
             title: 'Save Remote File As',
@@ -2518,7 +2636,9 @@ class EditorWindow extends Gtk.ApplicationWindow {
                 tab.remotePath = nextPath;
                 this._applyLanguageForTab(tab);
                 this._updateTabLabel(tab);
-                this.saveRemote(tab);
+                this.saveRemote(tab, onSaved);
+            } else if (onSaved) {
+                onSaved(false);
             }
 
             dialog.destroy();
