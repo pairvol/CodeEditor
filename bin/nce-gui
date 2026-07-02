@@ -12,6 +12,7 @@ const ByteArray = imports.byteArray;
 const APP_ID = GLib.getenv('NCE_APP_ID') || 'dev.pairvol.NativeCodeEditor';
 const CONFIG_DIR = GLib.build_filenamev([GLib.get_user_config_dir(), 'native-code-editor']);
 const CONFIG_FILE = GLib.build_filenamev([CONFIG_DIR, 'settings.json']);
+const EXTENSIONS_DIR = GLib.build_filenamev([CONFIG_DIR, 'extensions']);
 const DEFAULT_THEME = 'dark';
 const THEME_ORDER = ['dark', 'light', 'custom'];
 const LANGUAGE_BY_EXTENSION = {
@@ -131,6 +132,53 @@ function saveSettings(settings) {
         GLib.file_set_contents(CONFIG_FILE, JSON.stringify(settings, null, 2));
     } catch (error) {
         logError(error, 'Unable to save editor settings');
+    }
+}
+
+// Extension support, early stage: any *.js file dropped into
+// EXTENSIONS_DIR is run once at startup with the Gtk.Application instance
+// in scope as `app`. There is no formal extension API yet (no registration
+// contract, no lifecycle, no sandboxing) — a script's top-level code is its
+// entire entry point, and it can reach into `app.get_windows()` to touch a
+// live EditorWindow directly. This is intentionally the smallest possible
+// foundation to build a real API on top of later.
+function loadExtensions(app) {
+    const dir = Gio.File.new_for_path(EXTENSIONS_DIR);
+    if (!dir.query_exists(null))
+        return;
+
+    let enumerator;
+    try {
+        enumerator = dir.enumerate_children(
+            'standard::name,standard::type',
+            Gio.FileQueryInfoFlags.NONE,
+            null
+        );
+    } catch (error) {
+        printerr(`Extensions: failed to list ${EXTENSIONS_DIR}: ${error.message}`);
+        return;
+    }
+
+    const names = [];
+    let info;
+    while ((info = enumerator.next_file(null)) !== null) {
+        if (info.get_file_type() === Gio.FileType.REGULAR && info.get_name().endsWith('.js'))
+            names.push(info.get_name());
+    }
+    enumerator.close(null);
+    names.sort();
+
+    for (const name of names) {
+        const file = dir.get_child(name);
+        try {
+            const [, contents] = file.load_contents(null);
+            const source = ByteArray.toString(contents);
+            const run = new Function('app', `${source}\n//# sourceURL=extension:${name}`);
+            run(app);
+            print(`Extensions: loaded ${name}`);
+        } catch (error) {
+            printerr(`Extensions: ${name} failed: ${error.message || error}`);
+        }
     }
 }
 
@@ -3027,6 +3075,8 @@ const app = new Gtk.Application({
     application_id: APP_ID,
     flags: Gio.ApplicationFlags.HANDLES_OPEN,
 });
+
+app.connect('startup', () => loadExtensions(app));
 
 app.connect('activate', application => {
     const win = new EditorWindow(application);

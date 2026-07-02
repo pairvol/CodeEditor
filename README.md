@@ -1,5 +1,10 @@
 # Native Code Editor
 
+> **spark branch**: this is the earliest, most experimental line of
+> development. Things here can be unfinished or change shape entirely.
+> Features move to `labs` once they're mostly settled, and to `main` once
+> they're fully released.
+
 A small Linux-native text editor with no Electron or browser runtime.
 
 The repository contains two editors:
@@ -11,6 +16,23 @@ The repository contains two editors:
 
 The GTK editor is the main app. It supports opening, editing, and saving files
 over SSH in addition to local files.
+
+## Extensions (early, spark-only)
+
+Drop `.js` files into `~/.config/native-code-editor/extensions/` and they run
+once at startup, in filename-sort order, each with the running
+`Gtk.Application` instance in scope as `app`. A script's top-level code is its
+entire entry point — there's no registration contract, lifecycle, or
+sandboxing yet. A script can reach into `app.get_windows()` to touch a live
+editor window directly (add header buttons, register actions, etc.), but
+expect the internals it pokes at to change without notice at this stage.
+
+A failing extension is logged to stderr and skipped; it does not stop other
+extensions from loading or crash the app.
+
+This is intentionally the smallest possible foundation — a real extension API
+(defined hooks, a manifest format, permissions) is future work once this
+proves out.
 
 ## Build
 
