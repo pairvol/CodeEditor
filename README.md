@@ -34,6 +34,18 @@ This is intentionally the smallest possible foundation — a real extension API
 (defined hooks, a manifest format, permissions) is future work once this
 proves out.
 
+Sample extensions live in [`extensions/`](extensions/) in this repo. Install
+one by copying it into the extensions directory, e.g.:
+
+```sh
+cp extensions/run-java.js ~/.config/native-code-editor/extensions/
+```
+
+- `run-java.js`: adds a "Run Java" header button and `Ctrl+Shift+R`. Saves
+  the current tab (if it's a local `.java` file) and runs it with
+  `java <file>` (single-file source launch, JDK 11+), printing output to the
+  built-in console.
+
 ## Build
 
 ```sh
