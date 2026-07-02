@@ -490,7 +490,17 @@ class EditorWindow extends Gtk.ApplicationWindow {
             icon_name: 'document-print-preview-symbolic',
             tooltip_text: 'Toggle Live Preview',
         });
-        this._previewButton.connect('toggled', () => this._updatePreviewVisibility());
+        this._previewButton.connect('toggled', () => {
+            const tab = this._currentTab();
+            if (this._previewButton.active && this._isJavaTab(tab)) {
+                // Running Java is a one-shot action, not a toggleable view,
+                // so don't leave the button visually pressed afterward.
+                this._previewButton.active = false;
+                this._runJavaTab(tab);
+                return;
+            }
+            this._updatePreviewVisibility();
+        });
         header.pack_end(this._previewButton);
 
         this._themePopover = this._buildThemePopover();
@@ -1828,6 +1838,64 @@ class EditorWindow extends Gtk.ApplicationWindow {
         return isPreviewableFile(tab.file);
     }
 
+    _isJavaTab(tab) {
+        if (!tab)
+            return false;
+
+        if (tab.remotePath)
+            return basenameExtension(pathBasename(tab.remotePath)) === 'java';
+
+        return !!tab.file && basenameExtension(tab.file.get_basename()) === 'java';
+    }
+
+    _runJavaTab(tab) {
+        if (!tab)
+            return;
+
+        const path = filePathOrNull(tab.file);
+        if (!path) {
+            this._setStatus('Run Java requires a saved local .java file');
+            return;
+        }
+
+        const runNow = () => {
+            this._setConsoleVisible(true);
+            this._appendConsole(`\n$ java ${path}\n`);
+
+            try {
+                const launcher = new Gio.SubprocessLauncher({
+                    flags: Gio.SubprocessFlags.STDOUT_PIPE | Gio.SubprocessFlags.STDERR_PIPE,
+                });
+                const process = launcher.spawnv(['java', path]);
+                process.communicate_utf8_async(null, null, (proc, result) => {
+                    let stdout = '';
+                    let stderr = '';
+                    try {
+                        [, stdout, stderr] = proc.communicate_utf8_finish(result);
+                    } catch (error) {
+                        stderr = error.message || String(error);
+                    }
+
+                    GLib.idle_add(GLib.PRIORITY_DEFAULT, () => {
+                        if (stdout)
+                            this._appendConsole(stdout.endsWith('\n') ? stdout : `${stdout}\n`);
+                        if (stderr)
+                            this._appendConsole(stderr.endsWith('\n') ? stderr : `${stderr}\n`);
+                        this._appendConsole(`[exit ${proc.get_exit_status()}]\n`);
+                        return GLib.SOURCE_REMOVE;
+                    });
+                });
+            } catch (error) {
+                this._appendConsole(`Run Java failed: ${error.message}\n`);
+            }
+        };
+
+        if (tab.dirty)
+            this.save(tab, ok => { if (ok) runNow(); });
+        else
+            runNow();
+    }
+
     _previewBaseUri(tab) {
         if (tab && tab.remotePath)
             return null;
@@ -1848,11 +1916,25 @@ class EditorWindow extends Gtk.ApplicationWindow {
         if (!this._previewPanel || !this._previewButton)
             return;
 
+        const tab = this._currentTab();
+        const isJava = this._isJavaTab(tab);
+        this._previewButton.icon_name = isJava
+            ? 'media-playback-start-symbolic'
+            : 'document-print-preview-symbolic';
+        this._previewButton.tooltip_text = isJava
+            ? 'Run Java (Ctrl+Shift+P)'
+            : 'Toggle Live Preview (Ctrl+Shift+P)';
+
+        if (isJava) {
+            this._previewPanel.visible = false;
+            return;
+        }
+
         const shouldShow = this._previewButton.active && this._activeTabPreviewable();
         this._previewPanel.visible = shouldShow;
 
         if (this._previewButton.active && !shouldShow)
-            this._setStatus('Preview supports HTML and PHP files');
+            this._setStatus('Live preview supports HTML and PHP files; running supports .java files');
 
         if (shouldShow)
             this._refreshPreview();

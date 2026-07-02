@@ -32,23 +32,9 @@ extensions from loading or crash the app.
 
 This is intentionally the smallest possible foundation — a real extension API
 (defined hooks, a manifest format, permissions) is future work once this
-proves out.
-
-Sample extensions live in [`extensions/`](extensions/) in this repo. Install
-one by copying it into the extensions directory, e.g.:
-
-```sh
-cp extensions/run-java.js ~/.config/native-code-editor/extensions/
-```
-
-- `run-java.js`: adds a "Run Java" header button (play icon) and
-  `Ctrl+Shift+R`. Save the current tab as `<ClassName>.java`, matching the
-  `public class` name exactly (Java requires this) — e.g. `public class
-  HelloWorld` must be saved as `HelloWorld.java`. Then click the button or
-  press the shortcut; it saves the file if needed and runs it with
-  `java <file>` (single-file source launch, requires a JDK 11+ `java` binary
-  on `PATH`), printing stdout/stderr/exit code to the built-in console panel
-  (which auto-opens).
+proves out. No sample extensions ship in this repo right now — running Java
+was the first thing built as an extension, then promoted into core (see
+below) once it proved out.
 
 ## Build
 
@@ -103,7 +89,8 @@ Windowed app:
 - `Ctrl-Shift-J`: toggle console
 - `` Ctrl-` ``: toggle terminal
 - `Ctrl-Shift-K`: connect over SSH
-- `Ctrl-Shift-P`: toggle live preview for HTML/PHP tabs
+- `Ctrl-Shift-P`: run/preview the current tab — toggles live preview for
+  HTML/PHP tabs, or runs the file for `.java` tabs
 - `Ctrl-Shift-T`: cycle dark/light/custom theme
 - `Ctrl-Shift-C`: edit custom theme colors
 - `Ctrl-Q`: quit
@@ -130,6 +117,10 @@ are marked with `*` and must be saved before closing.
 - Drag a tab out of the tab bar to tear it off into its own window
 - WebKitGTK live preview for HTML tabs
 - PHP preview uses the saved file and requires a `php` command on `PATH`
+- The preview button doubles as a run button: on a `.java` tab it saves (if
+  needed) and runs the file with `java <file>` (single-file source launch,
+  requires a JDK 11+ `java` binary on `PATH`), printing output to the
+  built-in console panel instead of showing a preview
 
 ## Terminal Editor
 
@@ -145,10 +136,11 @@ are marked with `*` and must be saved before closing.
 
 Current scope: tabbed code editing with tab tear-off into new windows, file
 explorer, quick open, shell console, an embedded terminal, JS/HTML/CSS and PHP
-syntax highlighting, HTML/PHP preview, file open/save/save-as,
-dark/light/custom themes, dirty state in the title and tab labels, SSH remote
-editing, and native desktop launcher metadata. Richer project tools and deeper
-code intelligence can build on this base.
+syntax highlighting, HTML/PHP preview, running `.java` files, file
+open/save/save-as, dark/light/custom themes, dirty state in the title and tab
+labels, SSH remote editing, an early extension loader, and native desktop
+launcher metadata. Richer project tools and deeper code intelligence can build
+on this base.
 
 ## Planned Features
 
