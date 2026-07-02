@@ -24,8 +24,6 @@ const LANGUAGE_BY_EXTENSION = {
 };
 const PREVIEW_EXTENSIONS = new Set(['html', 'htm', 'php']);
 const EXPLORER_MAX_ITEMS = 700;
-// SSH is temporarily disabled. The remote refresh path is crashing and needs
-// to be fixed before it goes back in the UI.
 const SSH_CONNECT_TIMEOUT_SECONDS = 8;
 const SSH_AUTH_KEY = 'key';
 const SSH_AUTH_PASSWORD = 'password';
@@ -373,6 +371,13 @@ class EditorWindow extends Gtk.ApplicationWindow {
             popover: this._savePopover,
         });
         header.pack_start(saveButton);
+
+        const sshButton = new Gtk.Button({
+            icon_name: 'network-server-symbolic',
+            tooltip_text: 'Connect over SSH',
+        });
+        sshButton.connect('clicked', () => this.openSshDialog());
+        header.pack_start(sshButton);
 
         this._consoleButton = new Gtk.ToggleButton({
             icon_name: 'applications-utilities-symbolic',
@@ -1109,39 +1114,32 @@ class EditorWindow extends Gtk.ApplicationWindow {
     }
 
     _refreshRemoteExplorer() {
-        printerr('SSH explorer step: begin refresh');
         const parent = this._remoteDir && this._remoteDir !== '/' ? pathParent(this._remoteDir) : null;
-        if (parent) {
-            printerr('SSH explorer step: add parent row');
+        if (parent)
             this._addExplorerRow('..', null, Gio.FileType.DIRECTORY, true, parent);
-        }
 
         const listedDir = this._remoteDir;
         this._runRemoteCommandAsync(
             'LC_ALL=C ls -Ap -- .',
             listedDir,
+            this._remote,
             `Listing ${this._remoteDisplayName(listedDir)}...`,
             (ok, stdout, stderr, status) => {
-                printerr('SSH explorer step: list callback');
                 if (!this._remote || this._remoteDir !== listedDir)
                     return;
 
-                printerr('SSH explorer step: clear list');
                 while (this._explorerList.get_first_child())
                     this._explorerList.remove(this._explorerList.get_first_child());
 
                 const currentParent = this._remoteDir && this._remoteDir !== '/' ? pathParent(this._remoteDir) : null;
-                if (currentParent) {
-                    printerr('SSH explorer step: re-add parent row');
+                if (currentParent)
                     this._addExplorerRow('..', null, Gio.FileType.DIRECTORY, true, currentParent);
-                }
 
                 if (!ok || status !== 0) {
                     this._setStatus(`SSH list failed: ${stderr.trim() || `exit ${status}`}`);
                     return;
                 }
 
-                printerr('SSH explorer step: build items');
                 const items = stdout.split('\n')
                     .map(line => line.trimEnd())
                     .filter(line => line && !line.startsWith('.'))
@@ -1164,11 +1162,9 @@ class EditorWindow extends Gtk.ApplicationWindow {
                     return a.name.localeCompare(b.name);
                 });
 
-                printerr('SSH explorer step: append items');
                 for (const item of items)
                     this._addExplorerRow(item.name, null, item.type, false, item.path);
 
-                printerr('SSH explorer step: status');
                 this._setStatus(`Listed ${this._remoteDisplayName(this._remoteDir)}`);
             }
         );
@@ -1865,6 +1861,7 @@ class EditorWindow extends Gtk.ApplicationWindow {
         this._addAction('new-tab', () => this.newTab());
         this._addAction('open', () => this.openDialog());
         this._addAction('open-folder', () => this.openFolderDialog());
+        this._addAction('connect-ssh', () => this.openSshDialog());
         this._addAction('save', () => this.save());
         this._addAction('save-as', () => this.saveAsDialog());
         this._addAction('close-tab', () => this.closeTab());
@@ -1884,7 +1881,7 @@ class EditorWindow extends Gtk.ApplicationWindow {
         app.set_accels_for_action('win.new-tab', ['<Primary>n']);
         app.set_accels_for_action('win.open', ['<Primary>o']);
         app.set_accels_for_action('win.open-folder', ['<Primary><Shift>o']);
-        // SSH accelerator disabled with the feature.
+        app.set_accels_for_action('win.connect-ssh', ['<Primary><Shift>k']);
         app.set_accels_for_action('win.save', ['<Primary>s']);
         app.set_accels_for_action('win.save-as', ['<Primary><Shift>s']);
         app.set_accels_for_action('win.close-tab', ['<Primary>w']);
@@ -2478,32 +2475,17 @@ class EditorWindow extends Gtk.ApplicationWindow {
 
                     this._remote = remote;
                     this._remoteDir = stdout.trim().split('\n').pop() || startPath;
-                    GLib.idle_add(GLib.PRIORITY_DEFAULT, () => {
+                    this._appendConsole(`SSH connected: ${this._remoteDisplayName(this._remoteDir)}\n`);
+                    this._setStatus(`SSH connected: ${this._remoteDisplayName(this._remoteDir)}`);
+                    this._setExplorerVisible(true);
+                    this._refreshExplorer();
+                    if (onConnected) {
                         try {
-                            printerr('SSH connect step: status');
-                            this._appendConsole(`SSH connected: ${this._remoteDisplayName(this._remoteDir)}\n`);
-                            this._setStatus(`SSH connected: ${this._remoteDisplayName(this._remoteDir)}`);
+                            onConnected();
                         } catch (error) {
-                            printerr(`SSH connect status failed: ${error.message || error}`);
+                            printerr(`SSH connect handler failed: ${error.message || error}`);
                         }
-                        GLib.idle_add(GLib.PRIORITY_DEFAULT, () => {
-                            printerr('SSH connect step: show explorer');
-                            try {
-                                this._setExplorerVisible(true);
-                            } catch (error) {
-                                printerr(`SSH explorer visibility failed: ${error.message || error}`);
-                            }
-                            if (onConnected) {
-                                try {
-                                    onConnected();
-                                } catch (error) {
-                                    printerr(`SSH connect handler failed: ${error.message || error}`);
-                                }
-                            }
-                            return GLib.SOURCE_REMOVE;
-                        });
-                        return GLib.SOURCE_REMOVE;
-                    });
+                    }
                     return GLib.SOURCE_REMOVE;
                 });
             }
