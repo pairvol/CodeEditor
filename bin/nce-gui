@@ -1596,6 +1596,7 @@ class EditorWindow extends Gtk.ApplicationWindow {
         };
         this._applyLanguageForTab(tab);
         this._applySourceSchemeForTab(tab);
+        this._applyCompletionForTab(tab);
 
         scroller._nceTab = tab;
         const pageNum = this._notebook.append_page(scroller, this._buildTabLabel(tab));
@@ -1733,6 +1734,26 @@ class EditorWindow extends Gtk.ApplicationWindow {
         const scheme = this._styleSchemeManager.get_scheme(schemeId);
         if (scheme)
             tab.buffer.set_style_scheme(scheme);
+    }
+
+    // Start of tab-complete: word completion works for any file, and
+    // snippet completion is language-aware, reading whatever language
+    // _applyLanguageForTab set on the buffer (js/html/css/php, or plain
+    // text) each time it's asked for proposals — no per-language wiring
+    // needed here beyond the buffer already having its language set.
+    _applyCompletionForTab(tab) {
+        if (!tab)
+            return;
+
+        try {
+            const completion = tab.view.get_completion();
+            const wordsProvider = new GtkSource.CompletionWords({title: 'Words'});
+            wordsProvider.register(tab.buffer);
+            completion.add_provider(wordsProvider);
+            completion.add_provider(new GtkSource.CompletionSnippets());
+        } catch (error) {
+            printerr(`Completion setup failed: ${error.message || error}`);
+        }
     }
 
     _applySourceSchemeToAllTabs() {

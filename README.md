@@ -121,6 +121,11 @@ are marked with `*` and must be saved before closing.
   needed) and runs the file with `java <file>` (single-file source launch,
   requires a JDK 11+ `java` binary on `PATH`), printing output to the
   built-in console panel instead of showing a preview
+- Early tab-to-complete: as you type, a popup suggests words already used in
+  the buffer, plus language-aware snippets (GtkSourceView's built-in snippet
+  library) for whatever language the current tab is detected as. Tab or click
+  a suggestion to accept it. This is a starting point — no project-wide
+  symbol awareness or language-server intelligence yet.
 
 ## Terminal Editor
 
@@ -136,11 +141,11 @@ are marked with `*` and must be saved before closing.
 
 Current scope: tabbed code editing with tab tear-off into new windows, file
 explorer, quick open, shell console, an embedded terminal, JS/HTML/CSS and PHP
-syntax highlighting, HTML/PHP preview, running `.java` files, file
-open/save/save-as, dark/light/custom themes, dirty state in the title and tab
-labels, SSH remote editing, an early extension loader, and native desktop
-launcher metadata. Richer project tools and deeper code intelligence can build
-on this base.
+syntax highlighting, HTML/PHP preview, running `.java` files, early tab-to-
+complete, file open/save/save-as, dark/light/custom themes, dirty state in
+the title and tab labels, SSH remote editing, an early extension loader, and
+native desktop launcher metadata. Richer project tools and deeper code
+intelligence can build on this base.
 
 ## Planned Features
 
