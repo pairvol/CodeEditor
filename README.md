@@ -41,10 +41,14 @@ one by copying it into the extensions directory, e.g.:
 cp extensions/run-java.js ~/.config/native-code-editor/extensions/
 ```
 
-- `run-java.js`: adds a "Run Java" header button and `Ctrl+Shift+R`. Saves
-  the current tab (if it's a local `.java` file) and runs it with
-  `java <file>` (single-file source launch, JDK 11+), printing output to the
-  built-in console.
+- `run-java.js`: adds a "Run Java" header button (play icon) and
+  `Ctrl+Shift+R`. Save the current tab as `<ClassName>.java`, matching the
+  `public class` name exactly (Java requires this) — e.g. `public class
+  HelloWorld` must be saved as `HelloWorld.java`. Then click the button or
+  press the shortcut; it saves the file if needed and runs it with
+  `java <file>` (single-file source launch, requires a JDK 11+ `java` binary
+  on `PATH`), printing stdout/stderr/exit code to the built-in console panel
+  (which auto-opens).
 
 ## Build
 
@@ -153,6 +157,10 @@ code intelligence can build on this base.
 - Git status indicators in the file explorer
 - Richer SSH remote support: create, rename, and delete files/folders on the
   remote host (currently limited to browse/open/save)
+
+## Feedback
+
+Have thoughts on this branch? [Take the survey](https://tally.so/r/Y5g6JJ).
 
 ## License
 
