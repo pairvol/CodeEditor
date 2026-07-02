@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=Native Code Editor
+Comment=Native Linux text editor
+Exec=nce-gui %F
+Terminal=false
+Categories=Utility;TextEditor;
+MimeType=text/plain;text/x-c;text/x-csrc;text/x-chdr;text/x-python;text/x-shellscript;text/markdown;application/json;application/xml;
+StartupNotify=true

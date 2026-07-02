@@ -1,0 +1,8 @@
+nce
+*.o
+*.log
+/tmp/
+/.cache/
+/.idea/
+/.vscode/
+/.pytest_cache/

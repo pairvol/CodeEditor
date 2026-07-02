@@ -1,0 +1,2549 @@
+#!/usr/bin/env gjs
+
+imports.gi.versions.Gtk = '4.0';
+imports.gi.versions.Gdk = '4.0';
+imports.gi.versions.GtkSource = '5';
+imports.gi.versions.WebKit = '6.0';
+
+const {Gdk, Gio, GLib, GObject, Gtk, GtkSource, WebKit} = imports.gi;
+const ByteArray = imports.byteArray;
+
+const APP_ID = GLib.getenv('NCE_APP_ID') || 'dev.pairvol.NativeCodeEditor';
+const CONFIG_DIR = GLib.build_filenamev([GLib.get_user_config_dir(), 'native-code-editor']);
+const CONFIG_FILE = GLib.build_filenamev([CONFIG_DIR, 'settings.json']);
+const DEFAULT_THEME = 'dark';
+const THEME_ORDER = ['dark', 'light', 'custom'];
+const LANGUAGE_BY_EXTENSION = {
+    cjs: 'js',
+    css: 'css',
+    htm: 'html',
+    html: 'html',
+    js: 'js',
+    mjs: 'js',
+    php: 'php',
+};
+const PREVIEW_EXTENSIONS = new Set(['html', 'htm', 'php']);
+const EXPLORER_MAX_ITEMS = 700;
+// SSH is temporarily disabled. The remote refresh path is crashing and needs
+// to be fixed before it goes back in the UI.
+const SSH_CONNECT_TIMEOUT_SECONDS = 8;
+const SSH_AUTH_KEY = 'key';
+const SSH_AUTH_PASSWORD = 'password';
+
+const DEFAULT_CUSTOM_THEME = {
+    background: '#0f1218',
+    headerBackground: '#0f1218',
+    foreground: '#e6edf3',
+    editorBackground: '#0f1218',
+    editorText: '#d8dee9',
+    caret: '#f2cc60',
+    selectionBackground: '#2d5f8f',
+    selectionText: '#f4f8ff',
+    statusBackground: '#151a23',
+    statusText: '#aab4c0',
+    border: '#242b38',
+};
+
+const CUSTOM_THEME_FIELDS = [
+    ['background', 'Window background'],
+    ['headerBackground', 'Header background'],
+    ['foreground', 'Header text'],
+    ['editorBackground', 'Editor background'],
+    ['editorText', 'Editor text'],
+    ['caret', 'Caret'],
+    ['selectionBackground', 'Selection background'],
+    ['selectionText', 'Selection text'],
+    ['statusBackground', 'Status background'],
+    ['statusText', 'Status text'],
+    ['border', 'Borders'],
+];
+
+const THEMES = {
+    dark: {
+        label: 'Dark',
+        className: 'theme-dark',
+        icon: 'weather-clear-night-symbolic',
+        status: 'Dark mode',
+    },
+    light: {
+        label: 'Light',
+        className: 'theme-light',
+        icon: 'weather-clear-symbolic',
+        status: 'Light mode',
+    },
+    custom: {
+        label: 'Custom',
+        className: 'theme-custom',
+        icon: 'applications-graphics-symbolic',
+        status: 'Custom theme',
+    },
+};
+
+function normalizeHexColor(value) {
+    const match = value.trim().match(/^#?([0-9a-fA-F]{3}|[0-9a-fA-F]{6})$/);
+    if (!match)
+        return null;
+
+    let hex = match[1].toLowerCase();
+    if (hex.length === 3)
+        hex = hex.split('').map(char => char + char).join('');
+
+    return `#${hex}`;
+}
+
+function sanitizeCustomTheme(values = {}) {
+    const theme = {};
+    for (const [key] of CUSTOM_THEME_FIELDS) {
+        const normalized = typeof values[key] === 'string' ? normalizeHexColor(values[key]) : null;
+        theme[key] = normalized || DEFAULT_CUSTOM_THEME[key];
+    }
+    return theme;
+}
+
+function isDarkHexColor(value) {
+    const color = normalizeHexColor(value) || '#000000';
+    const red = parseInt(color.slice(1, 3), 16) / 255;
+    const green = parseInt(color.slice(3, 5), 16) / 255;
+    const blue = parseInt(color.slice(5, 7), 16) / 255;
+    const luminance = 0.2126 * red + 0.7152 * green + 0.0722 * blue;
+    return luminance < 0.45;
+}
+
+function loadSettings() {
+    if (!GLib.file_test(CONFIG_FILE, GLib.FileTest.EXISTS))
+        return {};
+
+    try {
+        const [ok, contents] = GLib.file_get_contents(CONFIG_FILE);
+        if (ok)
+            return JSON.parse(ByteArray.toString(contents));
+    } catch (error) {
+        logError(error, 'Unable to load editor settings');
+    }
+    return {};
+}
+
+function saveSettings(settings) {
+    try {
+        GLib.mkdir_with_parents(CONFIG_DIR, 0o700);
+        GLib.file_set_contents(CONFIG_FILE, JSON.stringify(settings, null, 2));
+    } catch (error) {
+        logError(error, 'Unable to save editor settings');
+    }
+}
+
+function basenameExtension(name) {
+    const dot = name.lastIndexOf('.');
+    if (dot < 0 || dot === name.length - 1)
+        return '';
+    return name.slice(dot + 1).toLowerCase();
+}
+
+function languageIdForFile(file) {
+    if (!file)
+        return null;
+
+    return LANGUAGE_BY_EXTENSION[basenameExtension(file.get_basename())] || null;
+}
+
+function languageIdForName(name) {
+    return LANGUAGE_BY_EXTENSION[basenameExtension(name)] || null;
+}
+
+function isPreviewableFile(file) {
+    return file && PREVIEW_EXTENSIONS.has(basenameExtension(file.get_basename()));
+}
+
+function sourceSchemeForTheme(theme, customTheme) {
+    if (theme === 'light')
+        return 'Adwaita';
+    if (theme === 'custom' && !isDarkHexColor(customTheme.editorBackground))
+        return 'Adwaita';
+    return 'Adwaita-dark';
+}
+
+function filePathOrNull(file) {
+    try {
+        return file ? file.get_path() : null;
+    } catch (_error) {
+        return null;
+    }
+}
+
+function shellQuote(value) {
+    return `'${String(value).replaceAll("'", "'\\''")}'`;
+}
+
+function pathBasename(path) {
+    const trimmed = path.endsWith('/') && path.length > 1 ? path.slice(0, -1) : path;
+    const slash = trimmed.lastIndexOf('/');
+    return slash >= 0 ? trimmed.slice(slash + 1) : trimmed;
+}
+
+function pathParent(path) {
+    const trimmed = path.endsWith('/') && path.length > 1 ? path.slice(0, -1) : path;
+    const slash = trimmed.lastIndexOf('/');
+    if (slash <= 0)
+        return '/';
+    return trimmed.slice(0, slash);
+}
+
+function pathJoin(base, name) {
+    if (base === '/')
+        return `/${name}`;
+    return `${base.replace(/\/+$/, '')}/${name}`;
+}
+
+function escapeHtml(text) {
+    return text
+        .replaceAll('&', '&amp;')
+        .replaceAll('<', '&lt;')
+        .replaceAll('>', '&gt;')
+        .replaceAll('"', '&quot;');
+}
+
+function looksLikeSshAuthFailure(stderr) {
+    const text = String(stderr || '').toLowerCase();
+    return text.includes('permission denied') ||
+        text.includes('passphrase') ||
+        text.includes('authentication') ||
+        text.includes('publickey');
+}
+
+function buildCustomCss(colors) {
+    return `
+        window.theme-custom {
+            background: ${colors.background};
+            color: ${colors.foreground};
+        }
+
+        window.theme-custom headerbar {
+            background: ${colors.headerBackground};
+            color: ${colors.foreground};
+            border-bottom: 1px solid ${colors.border};
+        }
+
+        window.theme-custom textview.editor,
+        window.theme-custom textview.editor text,
+        window.theme-custom sourceview.editor,
+        window.theme-custom sourceview.editor text {
+            background: ${colors.editorBackground};
+            color: ${colors.editorText};
+            caret-color: ${colors.caret};
+        }
+
+        window.theme-custom textview.editor selection,
+        window.theme-custom textview.editor text selection,
+        window.theme-custom sourceview.editor selection,
+        window.theme-custom sourceview.editor text selection {
+            background: ${colors.selectionBackground};
+            color: ${colors.selectionText};
+        }
+
+        window.theme-custom label.status {
+            background: ${colors.statusBackground};
+            border-top: 1px solid ${colors.border};
+            color: ${colors.statusText};
+        }
+
+        window.theme-custom button {
+            color: ${colors.foreground};
+        }
+
+        window.theme-custom box.sidebar,
+        window.theme-custom box.preview-panel,
+        window.theme-custom box.console-panel {
+            background: ${colors.statusBackground};
+            color: ${colors.statusText};
+            border-color: ${colors.border};
+        }
+
+        window.theme-custom textview.console-output,
+        window.theme-custom textview.console-output text {
+            background: ${colors.editorBackground};
+            color: ${colors.editorText};
+        }
+    `;
+}
+
+const EditorWindow = GObject.registerClass(
+class EditorWindow extends Gtk.ApplicationWindow {
+    _init(application, file = null) {
+        super._init({
+            application,
+            default_width: 960,
+            default_height: 680,
+            title: 'Native Code Editor',
+        });
+
+        this._untitledCount = 1;
+        this._settings = loadSettings();
+        this._customTheme = sanitizeCustomTheme(this._settings.customTheme);
+        this._theme = THEMES[this._settings.theme] ? this._settings.theme : DEFAULT_THEME;
+        this._languageManager = GtkSource.LanguageManager.get_default();
+        this._styleSchemeManager = GtkSource.StyleSchemeManager.get_default();
+        this._workspaceDir = Gio.File.new_for_path(GLib.get_current_dir());
+        this._remote = null;
+        this._remoteDir = null;
+        if (file && file.get_parent())
+            this._workspaceDir = file.get_parent();
+
+        this._buildUi();
+        this._installActions();
+        this._applyCustomCss();
+        this.setTheme(this._theme, false, false);
+        this.connect('close-request', () => {
+            if (this._hasDirtyTabs()) {
+                this._setStatus('Save modified tabs before quitting');
+                return true;
+            }
+            return false;
+        });
+
+        if (file)
+            this.loadFile(file);
+        else
+            this.newTab(false);
+    }
+
+    _buildUi() {
+        const root = new Gtk.Box({
+            orientation: Gtk.Orientation.VERTICAL,
+            spacing: 0,
+        });
+        root.add_css_class('app-root');
+        this._root = root;
+        this.set_child(root);
+
+        const header = new Gtk.HeaderBar();
+        this.set_titlebar(header);
+
+        const newTabButton = new Gtk.Button({
+            icon_name: 'document-new-symbolic',
+            tooltip_text: 'New Tab',
+        });
+        newTabButton.connect('clicked', () => this.newTab());
+        header.pack_start(newTabButton);
+
+        const openButton = new Gtk.Button({
+            icon_name: 'document-open-symbolic',
+            tooltip_text: 'Open',
+        });
+        openButton.connect('clicked', () => this.openDialog());
+        header.pack_start(openButton);
+
+        const openFolderButton = new Gtk.Button({
+            icon_name: 'folder-symbolic',
+            tooltip_text: 'Open Folder',
+        });
+        openFolderButton.connect('clicked', () => this.openFolderDialog());
+        header.pack_start(openFolderButton);
+
+        this._explorerButton = new Gtk.ToggleButton({
+            icon_name: 'sidebar-show-symbolic',
+            tooltip_text: 'Toggle File Explorer',
+        });
+        this._explorerButton.connect('toggled', () => {
+            this._setExplorerVisible(this._explorerButton.active, false);
+        });
+        header.pack_start(this._explorerButton);
+
+        this._savePopover = this._buildSavePopover();
+        const saveButton = new Gtk.MenuButton({
+            icon_name: 'document-save-symbolic',
+            tooltip_text: 'Save options',
+            popover: this._savePopover,
+        });
+        header.pack_start(saveButton);
+
+        this._consoleButton = new Gtk.ToggleButton({
+            icon_name: 'applications-utilities-symbolic',
+            tooltip_text: 'Toggle Console',
+        });
+        this._consoleButton.connect('toggled', () => {
+            this._setConsoleVisible(this._consoleButton.active, false);
+        });
+        header.pack_end(this._consoleButton);
+
+        this._busySpinner = new Gtk.Spinner({
+            visible: false,
+            tooltip_text: 'SSH operation running',
+        });
+        header.pack_end(this._busySpinner);
+
+        this._previewButton = new Gtk.ToggleButton({
+            icon_name: 'document-print-preview-symbolic',
+            tooltip_text: 'Toggle Live Preview',
+        });
+        this._previewButton.connect('toggled', () => this._updatePreviewVisibility());
+        header.pack_end(this._previewButton);
+
+        this._themePopover = this._buildThemePopover();
+        this._themeButton = new Gtk.MenuButton({
+            icon_name: THEMES[this._theme].icon,
+            tooltip_text: `Theme: ${THEMES[this._theme].label}`,
+            popover: this._themePopover,
+        });
+        header.pack_end(this._themeButton);
+
+        this._titleLabel = new Gtk.Label({
+            label: 'Native Code Editor',
+            single_line_mode: true,
+            ellipsize: 3,
+        });
+        header.set_title_widget(this._titleLabel);
+
+        this._mainPaned = new Gtk.Paned({
+            orientation: Gtk.Orientation.HORIZONTAL,
+            hexpand: true,
+            vexpand: true,
+        });
+        this._explorerPanel = this._buildExplorerPanel();
+        this._explorerPanel.visible = false;
+        this._mainPaned.set_start_child(this._explorerPanel);
+        this._mainPaned.set_end_child(this._buildWorkspacePanel());
+        this._mainPaned.set_position(240);
+        root.append(this._mainPaned);
+
+        this._status = new Gtk.Label({
+            label: 'Ready',
+            xalign: 0,
+            margin_start: 10,
+            margin_end: 10,
+            margin_top: 4,
+            margin_bottom: 4,
+        });
+        this._status.add_css_class('status');
+        root.append(this._status);
+
+        const css = new Gtk.CssProvider();
+        const cssData = `
+            window {
+                background: #0f1218;
+            }
+
+            window.theme-light {
+                background: @theme_bg_color;
+                color: @theme_fg_color;
+            }
+
+            window.theme-dark,
+            window.theme-dark headerbar {
+                background: #0f1218;
+                color: #e6edf3;
+            }
+
+            window.theme-dark headerbar {
+                border-bottom: 1px solid #242b38;
+            }
+
+            textview.editor {
+                font-family: monospace;
+                font-size: 12pt;
+            }
+
+            sourceview.editor {
+                font-family: monospace;
+                font-size: 12pt;
+            }
+
+            window.theme-light textview.editor,
+            window.theme-light textview.editor text,
+            window.theme-light sourceview.editor,
+            window.theme-light sourceview.editor text {
+                background: #fbfbfc;
+                color: #1f2328;
+                caret-color: #0969da;
+            }
+
+            window.theme-light textview.editor selection,
+            window.theme-light textview.editor text selection,
+            window.theme-light sourceview.editor selection,
+            window.theme-light sourceview.editor text selection {
+                background: #b6d7ff;
+                color: #0b1f33;
+            }
+
+            window.theme-dark textview.editor,
+            window.theme-dark textview.editor text,
+            window.theme-dark sourceview.editor,
+            window.theme-dark sourceview.editor text {
+                background: #0f1218;
+                color: #d8dee9;
+                caret-color: #f2cc60;
+            }
+
+            window.theme-dark textview.editor selection,
+            window.theme-dark textview.editor text selection,
+            window.theme-dark sourceview.editor selection,
+            window.theme-dark sourceview.editor text selection {
+                background: #2d5f8f;
+                color: #f4f8ff;
+            }
+
+            label.status {
+                background: @theme_bg_color;
+                border-top: 1px solid @borders;
+                color: @theme_fg_color;
+            }
+
+            window.theme-light label.status {
+                background: #f2f4f8;
+                border-top: 1px solid #d0d7de;
+                color: #3b424c;
+            }
+
+            window.theme-dark label.status {
+                background: #151a23;
+                border-top: 1px solid #242b38;
+                color: #aab4c0;
+            }
+
+            window.theme-dark button {
+                color: #e6edf3;
+            }
+
+            notebook.editor-tabs button.tab-close {
+                min-width: 22px;
+                min-height: 22px;
+                padding: 0;
+            }
+
+            box.sidebar,
+            box.preview-panel,
+            box.console-panel {
+                border-color: #242b38;
+            }
+
+            box.sidebar {
+                border-right: 1px solid #242b38;
+            }
+
+            box.preview-panel {
+                border-left: 1px solid #242b38;
+            }
+
+            box.console-panel {
+                border-top: 1px solid #242b38;
+            }
+
+            .panel-title {
+                font-weight: 700;
+            }
+
+            .path-label {
+                font-size: 0.9em;
+                opacity: 0.75;
+            }
+
+            textview.console-output,
+            textview.console-output text {
+                background: #0b0e13;
+                color: #d8dee9;
+            }
+
+            window.theme-light box.sidebar,
+            window.theme-light box.preview-panel,
+            window.theme-light box.console-panel {
+                background: #f6f8fa;
+                color: #1f2328;
+                border-color: #d0d7de;
+            }
+
+            window.theme-light textview.console-output,
+            window.theme-light textview.console-output text {
+                background: #ffffff;
+                color: #1f2328;
+            }
+
+            window.theme-dark box.sidebar,
+            window.theme-dark box.preview-panel,
+            window.theme-dark box.console-panel {
+                background: #151a23;
+                color: #d8dee9;
+                border-color: #242b38;
+            }
+        `;
+        css.load_from_data(cssData, cssData.length);
+        Gtk.StyleContext.add_provider_for_display(
+            Gdk.Display.get_default(),
+            css,
+            Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION
+        );
+
+        this._customCss = new Gtk.CssProvider();
+        Gtk.StyleContext.add_provider_for_display(
+            Gdk.Display.get_default(),
+            this._customCss,
+            Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION + 1
+        );
+    }
+
+    _buildExplorerPanel() {
+        const panel = new Gtk.Box({
+            orientation: Gtk.Orientation.VERTICAL,
+            spacing: 0,
+            width_request: 220,
+        });
+        panel.add_css_class('sidebar');
+
+        const header = new Gtk.Box({
+            orientation: Gtk.Orientation.HORIZONTAL,
+            spacing: 6,
+            margin_top: 8,
+            margin_bottom: 6,
+            margin_start: 8,
+            margin_end: 8,
+        });
+        panel.append(header);
+
+        const title = new Gtk.Label({
+            label: 'Files',
+            xalign: 0,
+            hexpand: true,
+        });
+        title.add_css_class('panel-title');
+        header.append(title);
+
+        const refreshButton = new Gtk.Button({
+            icon_name: 'view-refresh-symbolic',
+            tooltip_text: 'Refresh Files',
+        });
+        refreshButton.connect('clicked', () => this._refreshExplorer());
+        header.append(refreshButton);
+
+        this._workspaceLabel = new Gtk.Label({
+            xalign: 0,
+            ellipsize: 1,
+            margin_start: 8,
+            margin_end: 8,
+            margin_bottom: 6,
+        });
+        this._workspaceLabel.add_css_class('path-label');
+        panel.append(this._workspaceLabel);
+
+        this._explorerList = new Gtk.ListBox({
+            selection_mode: Gtk.SelectionMode.NONE,
+            activate_on_single_click: false,
+        });
+        this._explorerList.connect('row-activated', (_list, row) => this._openExplorerRow(row));
+
+        const scroller = new Gtk.ScrolledWindow({
+            hexpand: true,
+            vexpand: true,
+            child: this._explorerList,
+        });
+        panel.append(scroller);
+
+        this._refreshExplorer();
+        return panel;
+    }
+
+    _buildWorkspacePanel() {
+        this._workspacePaned = new Gtk.Paned({
+            orientation: Gtk.Orientation.VERTICAL,
+            hexpand: true,
+            vexpand: true,
+        });
+
+        this._editorPreviewPaned = new Gtk.Paned({
+            orientation: Gtk.Orientation.HORIZONTAL,
+            hexpand: true,
+            vexpand: true,
+        });
+
+        this._notebook = new Gtk.Notebook({
+            hexpand: true,
+            vexpand: true,
+            scrollable: true,
+        });
+        this._notebook.add_css_class('editor-tabs');
+        this._notebook.connect('switch-page', () => {
+            this._updateTitle();
+            this._updatePreviewVisibility();
+            const tab = this._currentTab();
+            if (tab)
+                this._setStatus(`Editing ${this._tabLocation(tab)}`);
+        });
+
+        this._previewPanel = this._buildPreviewPanel();
+        this._previewPanel.visible = false;
+
+        this._editorPreviewPaned.set_start_child(this._notebook);
+        this._editorPreviewPaned.set_end_child(this._previewPanel);
+        this._editorPreviewPaned.set_position(650);
+
+        this._workspacePaned.set_start_child(this._editorPreviewPaned);
+        this._consolePanel = this._buildConsolePanel();
+        this._consolePanel.visible = false;
+        this._workspacePaned.set_end_child(this._consolePanel);
+        this._workspacePaned.set_position(480);
+
+        return this._workspacePaned;
+    }
+
+    _buildPreviewPanel() {
+        const panel = new Gtk.Box({
+            orientation: Gtk.Orientation.VERTICAL,
+            spacing: 0,
+            width_request: 360,
+        });
+        panel.add_css_class('preview-panel');
+
+        const header = new Gtk.Box({
+            orientation: Gtk.Orientation.HORIZONTAL,
+            spacing: 6,
+            margin_top: 6,
+            margin_bottom: 6,
+            margin_start: 8,
+            margin_end: 8,
+        });
+        panel.append(header);
+
+        this._previewLabel = new Gtk.Label({
+            label: 'Preview',
+            xalign: 0,
+            hexpand: true,
+        });
+        this._previewLabel.add_css_class('panel-title');
+        header.append(this._previewLabel);
+
+        const refreshButton = new Gtk.Button({
+            icon_name: 'view-refresh-symbolic',
+            tooltip_text: 'Refresh Preview',
+        });
+        refreshButton.connect('clicked', () => this._refreshPreview());
+        header.append(refreshButton);
+
+        this._webView = new WebKit.WebView({
+            hexpand: true,
+            vexpand: true,
+        });
+        panel.append(this._webView);
+
+        return panel;
+    }
+
+    _buildConsolePanel() {
+        const panel = new Gtk.Box({
+            orientation: Gtk.Orientation.VERTICAL,
+            spacing: 0,
+            height_request: 150,
+        });
+        panel.add_css_class('console-panel');
+
+        const header = new Gtk.Box({
+            orientation: Gtk.Orientation.HORIZONTAL,
+            spacing: 6,
+            margin_top: 6,
+            margin_bottom: 4,
+            margin_start: 8,
+            margin_end: 8,
+        });
+        panel.append(header);
+
+        const title = new Gtk.Label({
+            label: 'Console',
+            xalign: 0,
+            hexpand: true,
+        });
+        title.add_css_class('panel-title');
+        header.append(title);
+
+        const clearButton = new Gtk.Button({
+            label: 'Clear',
+            tooltip_text: 'Clear Console',
+        });
+        clearButton.connect('clicked', () => this._consoleBuffer.set_text('', -1));
+        header.append(clearButton);
+
+        this._consoleBuffer = new Gtk.TextBuffer();
+        this._consoleOutput = new Gtk.TextView({
+            buffer: this._consoleBuffer,
+            editable: false,
+            cursor_visible: false,
+            monospace: true,
+            wrap_mode: Gtk.WrapMode.WORD_CHAR,
+            left_margin: 8,
+            right_margin: 8,
+            top_margin: 6,
+            bottom_margin: 6,
+        });
+        this._consoleOutput.add_css_class('console-output');
+
+        const outputScroller = new Gtk.ScrolledWindow({
+            hexpand: true,
+            vexpand: true,
+            child: this._consoleOutput,
+        });
+        panel.append(outputScroller);
+
+        const inputRow = new Gtk.Box({
+            orientation: Gtk.Orientation.HORIZONTAL,
+            spacing: 6,
+            margin_top: 6,
+            margin_bottom: 6,
+            margin_start: 8,
+            margin_end: 8,
+        });
+        panel.append(inputRow);
+
+        this._consoleEntry = new Gtk.Entry({
+            hexpand: true,
+            placeholder_text: 'Run shell command in workspace',
+        });
+        this._consoleEntry.connect('activate', () => this._runConsoleCommand());
+        inputRow.append(this._consoleEntry);
+
+        const runButton = new Gtk.Button({
+            label: 'Run',
+        });
+        runButton.connect('clicked', () => this._runConsoleCommand());
+        inputRow.append(runButton);
+
+        this._appendConsole(`Workspace: ${this._workspacePath()}\n`);
+        return panel;
+    }
+
+    _nextUntitledName() {
+        const name = this._untitledCount === 1 ? 'Untitled' : `Untitled ${this._untitledCount}`;
+        this._untitledCount++;
+        return name;
+    }
+
+    _workspacePath() {
+        if (this._remote)
+            return `${this._remote.target}:${this._remoteDir || '~'}`;
+
+        return filePathOrNull(this._workspaceDir) || GLib.get_home_dir();
+    }
+
+    _beginBusy(message) {
+        this._busyCount = (this._busyCount || 0) + 1;
+        if (this._busySpinner) {
+            this._busySpinner.visible = true;
+            this._busySpinner.start();
+        }
+        if (message)
+            this._setStatus(message);
+    }
+
+    _endBusy(message = null) {
+        this._busyCount = Math.max((this._busyCount || 1) - 1, 0);
+        if (this._busyCount === 0 && this._busySpinner) {
+            this._busySpinner.stop();
+            this._busySpinner.visible = false;
+        }
+        if (message)
+            this._setStatus(message);
+    }
+
+    _ensureSshAskpass() {
+        if (this._sshAskpassPath && GLib.file_test(this._sshAskpassPath, GLib.FileTest.EXISTS))
+            return this._sshAskpassPath;
+
+        this._sshAskpassPath = GLib.build_filenamev([
+            GLib.get_tmp_dir(),
+            `nce-ssh-askpass-${GLib.get_user_name()}.sh`,
+        ]);
+
+        GLib.file_set_contents(
+            this._sshAskpassPath,
+            '#!/bin/sh\nprintf %s "$NCE_SSH_SECRET"\n'
+        );
+        GLib.spawn_sync(
+            null,
+            ['chmod', '700', this._sshAskpassPath],
+            null,
+            GLib.SpawnFlags.SEARCH_PATH,
+            null
+        );
+        return this._sshAskpassPath;
+    }
+
+    _applySshEnvToLauncher(launcher, remote = this._remote) {
+        if (!remote || remote.secret === null || remote.secret === undefined)
+            return;
+
+        launcher.setenv('SSH_ASKPASS', this._ensureSshAskpass(), true);
+        launcher.setenv('SSH_ASKPASS_REQUIRE', 'force', true);
+        launcher.setenv('NCE_SSH_SECRET', remote.secret, true);
+    }
+
+    _sshOptions(remote = this._remote) {
+        const args = [
+            '-o', `ConnectTimeout=${SSH_CONNECT_TIMEOUT_SECONDS}`,
+            '-o', 'StrictHostKeyChecking=accept-new',
+            '-p', String(remote.port),
+        ];
+
+        if (remote.authMode === SSH_AUTH_PASSWORD) {
+            args.push(
+                '-o', 'PreferredAuthentications=password,keyboard-interactive',
+                '-o', 'PubkeyAuthentication=no'
+            );
+        } else {
+            args.push('-o', 'PreferredAuthentications=publickey');
+            if (remote.keyPath) {
+                args.push('-i', remote.keyPath);
+                args.push('-o', 'IdentitiesOnly=yes');
+            }
+        }
+
+        return args;
+    }
+
+    _remoteArgs(remote = this._remote) {
+        return [
+            'ssh',
+            ...this._sshOptions(remote),
+            remote.target,
+        ];
+    }
+
+    _scpArgs(remote = this._remote) {
+        return [
+            'scp',
+            '-q',
+            ...this._sshOptions(remote).map((arg, index, options) => {
+                if (arg === '-p')
+                    return '-P';
+                if (index > 0 && options[index - 1] === '-p')
+                    return arg;
+                return arg;
+            }),
+        ];
+    }
+
+    _runProcessAsync(args, remote, busyMessage, callback) {
+        this._beginBusy(busyMessage);
+        try {
+            const launcher = new Gio.SubprocessLauncher({
+                flags: Gio.SubprocessFlags.STDOUT_PIPE | Gio.SubprocessFlags.STDERR_PIPE,
+            });
+            this._applySshEnvToLauncher(launcher, remote);
+            const process = launcher.spawnv(args);
+            process.communicate_utf8_async(null, null, (proc, result) => {
+                let callbackArgs;
+                try {
+                    const [ok, stdout, stderr] = proc.communicate_utf8_finish(result);
+                    callbackArgs = [ok, stdout || '', stderr || '', proc.get_exit_status()];
+                } catch (error) {
+                    callbackArgs = [false, '', error.message || String(error), 1];
+                }
+
+                GLib.idle_add(GLib.PRIORITY_DEFAULT, () => {
+                    try {
+                        this._endBusy();
+                    } catch (error) {
+                        printerr(`SSH busy cleanup failed: ${error.message || error}`);
+                    }
+
+                    this._safeAsyncCallback(callback, callbackArgs);
+                    return GLib.SOURCE_REMOVE;
+                });
+            });
+        } catch (error) {
+            try {
+                this._endBusy();
+            } catch (_cleanupError) {
+                // Avoid letting callback cleanup terminate GJS.
+            }
+            this._safeAsyncCallback(callback, [false, '', error.message, 1]);
+        }
+    }
+
+    _safeAsyncCallback(callback, args) {
+        try {
+            callback(...args);
+        } catch (error) {
+            printerr(`Async SSH callback failed: ${error.message || error}`);
+            try {
+                this._setStatus(`SSH operation failed internally: ${error.message || error}`);
+            } catch (_statusError) {
+                // Avoid letting status rendering terminate GJS.
+            }
+        }
+    }
+
+    _runRemoteCommandAsync(command, cwd = this._remoteDir, remote = this._remote, busyMessage, callback) {
+        if (!remote) {
+            GLib.idle_add(GLib.PRIORITY_DEFAULT, () => {
+                this._safeAsyncCallback(callback, [false, '', 'Not connected to SSH', 1]);
+                return GLib.SOURCE_REMOVE;
+            });
+            return;
+        }
+
+        const remoteCommand = cwd ? `cd -- ${shellQuote(cwd)} && ${command}` : command;
+        this._runProcessAsync(
+            [...this._remoteArgs(remote), 'sh', '-lc', remoteCommand],
+            remote,
+            busyMessage,
+            callback
+        );
+    }
+
+    _remoteDisplayName(path) {
+        return `${this._remote.target}:${path}`;
+    }
+
+    _setExplorerVisible(visible, syncButton = true) {
+        if (this._explorerPanel)
+            this._explorerPanel.visible = visible;
+
+        if (syncButton && this._explorerButton)
+            this._explorerButton.active = visible;
+
+        this._setStatus(visible ? 'File explorer shown' : 'File explorer hidden');
+    }
+
+    _toggleExplorer() {
+        this._setExplorerVisible(!this._explorerPanel.visible);
+    }
+
+    _setConsoleVisible(visible, syncButton = true) {
+        if (this._consolePanel)
+            this._consolePanel.visible = visible;
+
+        if (syncButton && this._consoleButton)
+            this._consoleButton.active = visible;
+
+        if (visible && this._consoleEntry)
+            this._consoleEntry.grab_focus();
+
+        this._setStatus(visible ? 'Console shown' : 'Console hidden');
+    }
+
+    _toggleConsole() {
+        this._setConsoleVisible(!this._consolePanel.visible);
+    }
+
+    _setWorkspaceDir(file) {
+        if (!file)
+            return;
+
+        this._remote = null;
+        this._remoteDir = null;
+        this._workspaceDir = file;
+        this._refreshExplorer();
+        this._appendConsole(`Workspace: ${this._workspacePath()}\n`);
+    }
+
+    _refreshExplorer() {
+        if (!this._explorerList)
+            return;
+
+        while (this._explorerList.get_first_child())
+            this._explorerList.remove(this._explorerList.get_first_child());
+
+        const workspacePath = this._workspacePath();
+        this._workspaceLabel.label = workspacePath;
+
+        if (this._remote) {
+            this._refreshRemoteExplorer();
+            return;
+        }
+
+        const parent = this._workspaceDir.get_parent();
+        if (parent)
+            this._addExplorerRow('..', parent, Gio.FileType.DIRECTORY, true);
+
+        const items = [];
+        try {
+            const enumerator = this._workspaceDir.enumerate_children(
+                'standard::name,standard::type,standard::is-hidden',
+                Gio.FileQueryInfoFlags.NONE,
+                null
+            );
+            let info;
+            while ((info = enumerator.next_file(null)) !== null) {
+                if (info.get_is_hidden())
+                    continue;
+
+                const name = info.get_name();
+                const type = info.get_file_type();
+                items.push({
+                    name,
+                    type,
+                    file: this._workspaceDir.get_child(name),
+                });
+
+                if (items.length >= EXPLORER_MAX_ITEMS)
+                    break;
+            }
+            enumerator.close(null);
+        } catch (error) {
+            this._setStatus(`File explorer failed: ${error.message}`);
+            return;
+        }
+
+        items.sort((a, b) => {
+            const aDir = a.type === Gio.FileType.DIRECTORY;
+            const bDir = b.type === Gio.FileType.DIRECTORY;
+            if (aDir !== bDir)
+                return aDir ? -1 : 1;
+            return a.name.localeCompare(b.name);
+        });
+
+        for (const item of items)
+            this._addExplorerRow(item.name, item.file, item.type, false);
+    }
+
+    _refreshRemoteExplorer() {
+        printerr('SSH explorer step: begin refresh');
+        const parent = this._remoteDir && this._remoteDir !== '/' ? pathParent(this._remoteDir) : null;
+        if (parent) {
+            printerr('SSH explorer step: add parent row');
+            this._addExplorerRow('..', null, Gio.FileType.DIRECTORY, true, parent);
+        }
+
+        const listedDir = this._remoteDir;
+        this._runRemoteCommandAsync(
+            'LC_ALL=C ls -Ap -- .',
+            listedDir,
+            `Listing ${this._remoteDisplayName(listedDir)}...`,
+            (ok, stdout, stderr, status) => {
+                printerr('SSH explorer step: list callback');
+                if (!this._remote || this._remoteDir !== listedDir)
+                    return;
+
+                printerr('SSH explorer step: clear list');
+                while (this._explorerList.get_first_child())
+                    this._explorerList.remove(this._explorerList.get_first_child());
+
+                const currentParent = this._remoteDir && this._remoteDir !== '/' ? pathParent(this._remoteDir) : null;
+                if (currentParent) {
+                    printerr('SSH explorer step: re-add parent row');
+                    this._addExplorerRow('..', null, Gio.FileType.DIRECTORY, true, currentParent);
+                }
+
+                if (!ok || status !== 0) {
+                    this._setStatus(`SSH list failed: ${stderr.trim() || `exit ${status}`}`);
+                    return;
+                }
+
+                printerr('SSH explorer step: build items');
+                const items = stdout.split('\n')
+                    .map(line => line.trimEnd())
+                    .filter(line => line && !line.startsWith('.'))
+                    .slice(0, EXPLORER_MAX_ITEMS)
+                    .map(line => {
+                        const isDir = line.endsWith('/');
+                        const name = isDir ? line.slice(0, -1) : line.replace(/[*@|=]$/, '');
+                        return {
+                            name,
+                            path: pathJoin(this._remoteDir, name),
+                            type: isDir ? Gio.FileType.DIRECTORY : Gio.FileType.REGULAR,
+                        };
+                    });
+
+                items.sort((a, b) => {
+                    const aDir = a.type === Gio.FileType.DIRECTORY;
+                    const bDir = b.type === Gio.FileType.DIRECTORY;
+                    if (aDir !== bDir)
+                        return aDir ? -1 : 1;
+                    return a.name.localeCompare(b.name);
+                });
+
+                printerr('SSH explorer step: append items');
+                for (const item of items)
+                    this._addExplorerRow(item.name, null, item.type, false, item.path);
+
+                printerr('SSH explorer step: status');
+                this._setStatus(`Listed ${this._remoteDisplayName(this._remoteDir)}`);
+            }
+        );
+    }
+
+    _addExplorerRow(name, file, type, isParent, remotePath = null) {
+        const row = new Gtk.ListBoxRow({
+            activatable: true,
+        });
+        row._nceFile = file;
+        row._nceFileType = type;
+        row._nceRemotePath = remotePath;
+
+        const box = new Gtk.Box({
+            orientation: Gtk.Orientation.HORIZONTAL,
+            spacing: 8,
+            margin_top: 5,
+            margin_bottom: 5,
+            margin_start: 8,
+            margin_end: 8,
+        });
+
+        const icon = new Gtk.Image({
+            icon_name: isParent ? 'go-up-symbolic' :
+                type === Gio.FileType.DIRECTORY ? 'folder-symbolic' : 'text-x-generic-symbolic',
+        });
+        box.append(icon);
+
+        const label = new Gtk.Label({
+            label: name,
+            xalign: 0,
+            hexpand: true,
+            ellipsize: 3,
+        });
+        box.append(label);
+
+        row.set_child(box);
+        this._explorerList.append(row);
+    }
+
+    _openExplorerRow(row) {
+        if (!row)
+            return;
+
+        if (row._nceRemotePath) {
+            if (row._nceFileType === Gio.FileType.DIRECTORY) {
+                this._remoteDir = row._nceRemotePath;
+                this._refreshExplorer();
+                this._setStatus(`Opened remote folder ${this._remoteDisplayName(this._remoteDir)}`);
+            } else {
+                this.loadRemoteFile(row._nceRemotePath);
+            }
+            return;
+        }
+
+        if (!row._nceFile)
+            return;
+
+        if (row._nceFileType === Gio.FileType.DIRECTORY) {
+            this._setWorkspaceDir(row._nceFile);
+            this._setStatus(`Opened folder ${this._workspacePath()}`);
+        } else {
+            this.loadFile(row._nceFile);
+        }
+    }
+
+    _currentTab() {
+        const pageNum = this._notebook.get_current_page();
+        if (pageNum < 0)
+            return null;
+
+        const page = this._notebook.get_nth_page(pageNum);
+        return page ? page._nceTab : null;
+    }
+
+    _pageNumForTab(tab) {
+        const pages = this._notebook.get_n_pages();
+        for (let i = 0; i < pages; i++) {
+            const page = this._notebook.get_nth_page(i);
+            if (page && page._nceTab === tab)
+                return i;
+        }
+        return -1;
+    }
+
+    _hasDirtyTabs() {
+        const pages = this._notebook.get_n_pages();
+        for (let i = 0; i < pages; i++) {
+            const page = this._notebook.get_nth_page(i);
+            if (page && page._nceTab && page._nceTab.dirty)
+                return true;
+        }
+        return false;
+    }
+
+    _tabName(tab) {
+        if (tab.remotePath)
+            return pathBasename(tab.remotePath);
+        return tab.file ? tab.file.get_basename() : tab.untitledName;
+    }
+
+    _tabLocation(tab) {
+        if (tab.remotePath) {
+            const remote = tab.remote || this._remote;
+            return `${remote.target}:${tab.remotePath}`;
+        }
+        return tab.file ? tab.file.get_parse_name() : tab.untitledName;
+    }
+
+    _buildTabLabel(tab) {
+        const box = new Gtk.Box({
+            orientation: Gtk.Orientation.HORIZONTAL,
+            spacing: 6,
+        });
+
+        tab.titleLabel = new Gtk.Label({
+            xalign: 0,
+            max_width_chars: 24,
+            ellipsize: 3,
+        });
+        box.append(tab.titleLabel);
+
+        const closeButton = new Gtk.Button({
+            icon_name: 'window-close-symbolic',
+            tooltip_text: 'Close Tab',
+        });
+        closeButton.add_css_class('flat');
+        closeButton.add_css_class('tab-close');
+        closeButton.connect('clicked', () => this.closeTab(tab));
+        box.append(closeButton);
+
+        return box;
+    }
+
+    _createTab({file = null, remote = null, remotePath = null, text = '', dirty = false, announce = true} = {}) {
+        const buffer = new GtkSource.Buffer({
+            highlight_syntax: true,
+        });
+        const view = new GtkSource.View({
+            buffer,
+            monospace: true,
+            show_line_numbers: true,
+            highlight_current_line: true,
+            tab_width: 4,
+            insert_spaces_instead_of_tabs: true,
+            auto_indent: true,
+            wrap_mode: Gtk.WrapMode.NONE,
+            top_margin: 10,
+            bottom_margin: 10,
+            left_margin: 12,
+            right_margin: 12,
+        });
+        view.add_css_class('editor');
+
+        const scroller = new Gtk.ScrolledWindow({
+            hexpand: true,
+            vexpand: true,
+            child: view,
+        });
+
+        const tab = {
+            buffer,
+            view,
+            scroller,
+            file,
+            remote,
+            remotePath,
+            dirty,
+            loading: false,
+            untitledName: this._nextUntitledName(),
+            languageId: null,
+            titleLabel: null,
+        };
+        this._applyLanguageForTab(tab);
+        this._applySourceSchemeForTab(tab);
+
+        scroller._nceTab = tab;
+        const pageNum = this._notebook.append_page(scroller, this._buildTabLabel(tab));
+        this._notebook.set_tab_reorderable(scroller, true);
+
+        buffer.connect('changed', () => {
+            if (tab.loading)
+                return;
+
+            tab.dirty = true;
+            this._updateTabLabel(tab);
+            if (this._currentTab() === tab) {
+                this._updateTitle();
+                this._setStatus('Modified');
+                if (this._previewButton && this._previewButton.active && this._isPreviewableTab(tab))
+                    this._refreshPreview();
+            }
+        });
+
+        if (text) {
+            tab.loading = true;
+            buffer.set_text(text, -1);
+            tab.loading = false;
+        }
+
+        this._notebook.set_current_page(pageNum);
+        this._updateTabLabel(tab);
+        this._updateTitle();
+        view.grab_focus();
+
+        if (announce) {
+            if (remotePath)
+                this._setStatus(`Opened ${this._remoteDisplayName(remotePath)}`);
+            else
+                this._setStatus(file ? `Opened ${file.get_parse_name()}` : `New tab: ${tab.untitledName}`);
+        }
+
+        return tab;
+    }
+
+    newTab(announce = true) {
+        this._createTab({announce});
+    }
+
+    closeTab(tab = this._currentTab()) {
+        if (!tab)
+            return;
+
+        if (tab.dirty) {
+            this._setStatus(`Save ${this._tabName(tab)} before closing it`);
+            const pageNum = this._pageNumForTab(tab);
+            if (pageNum >= 0)
+                this._notebook.set_current_page(pageNum);
+            return;
+        }
+
+        const pageNum = this._pageNumForTab(tab);
+        if (pageNum < 0)
+            return;
+
+        this._notebook.remove_page(pageNum);
+        if (this._notebook.get_n_pages() === 0) {
+            this.newTab(false);
+            this._setStatus('New tab');
+        } else {
+            this._updateTitle();
+            const current = this._currentTab();
+            if (current)
+                this._setStatus(`Editing ${this._tabLocation(current)}`);
+        }
+    }
+
+    selectNextTab() {
+        const pages = this._notebook.get_n_pages();
+        if (pages <= 1)
+            return;
+        const current = this._notebook.get_current_page();
+        this._notebook.set_current_page((current + 1) % pages);
+    }
+
+    selectPreviousTab() {
+        const pages = this._notebook.get_n_pages();
+        if (pages <= 1)
+            return;
+        const current = this._notebook.get_current_page();
+        this._notebook.set_current_page((current - 1 + pages) % pages);
+    }
+
+    _isReusableBlankTab(tab) {
+        return tab &&
+            !tab.file &&
+            !tab.remotePath &&
+            !tab.dirty &&
+            this._bufferText(tab).length === 0;
+    }
+
+    _updateTabLabel(tab) {
+        if (!tab || !tab.titleLabel)
+            return;
+
+        const marker = tab.dirty ? '*' : '';
+        tab.titleLabel.label = `${this._tabName(tab)}${marker}`;
+    }
+
+    _applyLanguageForTab(tab) {
+        if (!tab)
+            return;
+
+        const languageId = tab.remotePath ? languageIdForName(pathBasename(tab.remotePath)) :
+            languageIdForFile(tab.file);
+        tab.languageId = languageId;
+        tab.buffer.set_language(languageId ? this._languageManager.get_language(languageId) : null);
+        tab.buffer.set_highlight_syntax(!!languageId);
+    }
+
+    _applySourceSchemeForTab(tab) {
+        if (!tab)
+            return;
+
+        const schemeId = sourceSchemeForTheme(this._theme, this._customTheme);
+        const scheme = this._styleSchemeManager.get_scheme(schemeId);
+        if (scheme)
+            tab.buffer.set_style_scheme(scheme);
+    }
+
+    _applySourceSchemeToAllTabs() {
+        if (!this._notebook)
+            return;
+
+        const pages = this._notebook.get_n_pages();
+        for (let i = 0; i < pages; i++) {
+            const page = this._notebook.get_nth_page(i);
+            if (page && page._nceTab)
+                this._applySourceSchemeForTab(page._nceTab);
+        }
+    }
+
+    _appendConsole(text) {
+        if (!this._consoleBuffer)
+            return;
+
+        const end = this._consoleBuffer.get_end_iter();
+        this._consoleBuffer.insert(end, text, -1);
+    }
+
+    _runConsoleCommand() {
+        const command = this._consoleEntry.text.trim();
+        if (!command)
+            return;
+
+        this._consoleEntry.text = '';
+        const cwd = this._workspacePath();
+        this._appendConsole(`\n${cwd} $ ${command}\n`);
+
+        if (this._remote) {
+            this._runRemoteCommandAsync(
+                command,
+                this._remoteDir,
+                this._remote,
+                `Running remote command: ${command}`,
+                (ok, stdout, stderr, status) => {
+                    if (ok) {
+                        if (stdout)
+                            this._appendConsole(stdout.endsWith('\n') ? stdout : `${stdout}\n`);
+                        if (stderr)
+                            this._appendConsole(stderr.endsWith('\n') ? stderr : `${stderr}\n`);
+                        if (status !== 0)
+                            this._appendConsole(`[exit ${status}]\n`);
+                    } else {
+                        this._appendConsole(`${stderr}\n`);
+                    }
+                }
+            );
+            return;
+        }
+
+        try {
+            const [ok, stdout, stderr, status] = GLib.spawn_sync(
+                cwd,
+                ['/bin/sh', '-lc', command],
+                null,
+                GLib.SpawnFlags.SEARCH_PATH,
+                null
+            );
+
+            if (ok) {
+                const outText = ByteArray.toString(stdout);
+                const errText = ByteArray.toString(stderr);
+                if (outText)
+                    this._appendConsole(outText.endsWith('\n') ? outText : `${outText}\n`);
+                if (errText)
+                    this._appendConsole(errText.endsWith('\n') ? errText : `${errText}\n`);
+                if (status !== 0)
+                    this._appendConsole(`[exit ${status}]\n`);
+            } else {
+                this._appendConsole('[command failed]\n');
+            }
+        } catch (error) {
+            this._appendConsole(`${error.message}\n`);
+        }
+    }
+
+    _activeTabPreviewable() {
+        const tab = this._currentTab();
+        return this._isPreviewableTab(tab);
+    }
+
+    _isPreviewableTab(tab) {
+        if (!tab)
+            return false;
+
+        if (tab.remotePath)
+            return PREVIEW_EXTENSIONS.has(basenameExtension(pathBasename(tab.remotePath)));
+
+        return isPreviewableFile(tab.file);
+    }
+
+    _previewBaseUri(tab) {
+        if (tab && tab.remotePath)
+            return null;
+
+        const file = tab && tab.file;
+        const parentPath = file && file.get_parent() ? file.get_parent().get_path() : this._workspacePath();
+        if (!parentPath)
+            return null;
+
+        try {
+            return GLib.filename_to_uri(parentPath, null);
+        } catch (_error) {
+            return null;
+        }
+    }
+
+    _updatePreviewVisibility() {
+        if (!this._previewPanel || !this._previewButton)
+            return;
+
+        const shouldShow = this._previewButton.active && this._activeTabPreviewable();
+        this._previewPanel.visible = shouldShow;
+
+        if (this._previewButton.active && !shouldShow)
+            this._setStatus('Preview supports HTML and PHP files');
+
+        if (shouldShow)
+            this._refreshPreview();
+    }
+
+    _refreshPreview() {
+        const tab = this._currentTab();
+        if (!tab || !this._webView)
+            return;
+
+        if (!this._isPreviewableTab(tab)) {
+            this._setStatus('Preview supports HTML and PHP files');
+            return;
+        }
+
+        const name = this._tabName(tab);
+        this._previewLabel.label = `Preview: ${name}`;
+
+        const ext = basenameExtension(name);
+        const source = this._bufferText(tab);
+        const baseUri = this._previewBaseUri(tab);
+
+        if (ext === 'php') {
+            this._renderPhpPreview(tab, source, baseUri);
+            return;
+        }
+
+        this._webView.load_html(source, baseUri);
+        this._setStatus(`Preview refreshed: ${name}`);
+    }
+
+    _renderPhpPreview(tab, source, baseUri) {
+        if (tab.remotePath) {
+            this._renderRemotePhpPreview(tab, source, baseUri);
+            return;
+        }
+
+        const phpPath = GLib.find_program_in_path('php');
+        if (!phpPath) {
+            this._webView.load_html(
+                `<main style="font: 14px system-ui; padding: 24px;">
+                    <h1>PHP preview unavailable</h1>
+                    <p>Install the <code>php</code> command-line runtime to render this file.</p>
+                    <pre>${escapeHtml(source)}</pre>
+                </main>`,
+                baseUri
+            );
+            this._setStatus('PHP preview needs php on PATH');
+            return;
+        }
+
+        const path = filePathOrNull(tab.file);
+        if (!path || tab.dirty) {
+            this._webView.load_html(
+                `<main style="font: 14px system-ui; padding: 24px;">
+                    <h1>Save before PHP preview</h1>
+                    <p>PHP preview runs the saved file through <code>php</code>.</p>
+                </main>`,
+                baseUri
+            );
+            this._setStatus('Save the PHP file before previewing it');
+            return;
+        }
+
+        try {
+            const [ok, stdout, stderr, status] = GLib.spawn_sync(
+                this._workspacePath(),
+                [phpPath, path],
+                null,
+                GLib.SpawnFlags.SEARCH_PATH,
+                null
+            );
+            const outText = ok ? ByteArray.toString(stdout) : '';
+            const errText = ok ? ByteArray.toString(stderr) : 'PHP failed to run';
+            if (status === 0) {
+                this._webView.load_html(outText, baseUri);
+                this._setStatus(`PHP preview refreshed: ${tab.file.get_basename()}`);
+            } else {
+                this._webView.load_html(
+                    `<main style="font: 14px monospace; padding: 24px; white-space: pre-wrap;">
+                        ${escapeHtml(errText)}
+                    </main>`,
+                    baseUri
+                );
+                this._setStatus(`PHP preview exited ${status}`);
+            }
+        } catch (error) {
+            this._setStatus(`PHP preview failed: ${error.message}`);
+        }
+    }
+
+    _renderRemotePhpPreview(tab, source, baseUri) {
+        if (tab.dirty) {
+            this._webView.load_html(
+                `<main style="font: 14px system-ui; padding: 24px;">
+                    <h1>Save before PHP preview</h1>
+                    <p>Remote PHP preview runs the saved file through <code>php</code> on the SSH host.</p>
+                </main>`,
+                baseUri
+            );
+            this._setStatus('Save the remote PHP file before previewing it');
+            return;
+        }
+
+        this._runRemoteCommandAsync(
+            `command -v php >/dev/null 2>&1 && php ${shellQuote(tab.remotePath)}`,
+            null,
+            tab.remote,
+            `Rendering remote PHP preview: ${this._tabName(tab)}...`,
+            (ok, stdout, stderr, status) => {
+                if (ok && status === 0) {
+                    this._webView.load_html(stdout, baseUri);
+                    this._setStatus(`Remote PHP preview refreshed: ${this._tabName(tab)}`);
+                    return;
+                }
+
+                this._webView.load_html(
+                    `<main style="font: 14px monospace; padding: 24px; white-space: pre-wrap;">
+                        ${escapeHtml(stderr || 'Remote PHP preview needs php on PATH')}
+                    </main>`,
+                    baseUri
+                );
+                this._setStatus(`Remote PHP preview failed: ${stderr.trim() || `exit ${status}`}`);
+            }
+        );
+    }
+
+    _buildSavePopover() {
+        const popover = new Gtk.Popover();
+        const box = new Gtk.Box({
+            orientation: Gtk.Orientation.VERTICAL,
+            spacing: 4,
+            margin_top: 8,
+            margin_bottom: 8,
+            margin_start: 8,
+            margin_end: 8,
+        });
+        popover.set_child(box);
+
+        const saveButton = new Gtk.Button({
+            label: 'Save',
+            halign: Gtk.Align.FILL,
+        });
+        saveButton.connect('clicked', () => {
+            this.save();
+            popover.popdown();
+        });
+        box.append(saveButton);
+
+        const saveAsButton = new Gtk.Button({
+            label: 'Save As...',
+            halign: Gtk.Align.FILL,
+        });
+        saveAsButton.connect('clicked', () => {
+            this.saveAsDialog();
+            popover.popdown();
+        });
+        box.append(saveAsButton);
+
+        return popover;
+    }
+
+    _buildThemePopover() {
+        const popover = new Gtk.Popover();
+        const box = new Gtk.Box({
+            orientation: Gtk.Orientation.VERTICAL,
+            spacing: 4,
+            margin_top: 8,
+            margin_bottom: 8,
+            margin_start: 8,
+            margin_end: 8,
+        });
+        popover.set_child(box);
+
+        for (const theme of ['dark', 'light']) {
+            const button = new Gtk.Button({
+                label: THEMES[theme].label,
+                halign: Gtk.Align.FILL,
+            });
+            button.connect('clicked', () => {
+                this.setTheme(theme);
+                popover.popdown();
+            });
+            box.append(button);
+        }
+
+        const customButton = new Gtk.Button({
+            label: 'Custom...',
+            halign: Gtk.Align.FILL,
+        });
+        customButton.connect('clicked', () => {
+            popover.popdown();
+            this.openCustomThemeDialog();
+        });
+        box.append(customButton);
+
+        return popover;
+    }
+
+    _installActions() {
+        this._addAction('new-tab', () => this.newTab());
+        this._addAction('open', () => this.openDialog());
+        this._addAction('open-folder', () => this.openFolderDialog());
+        this._addAction('save', () => this.save());
+        this._addAction('save-as', () => this.saveAsDialog());
+        this._addAction('close-tab', () => this.closeTab());
+        this._addAction('next-tab', () => this.selectNextTab());
+        this._addAction('previous-tab', () => this.selectPreviousTab());
+        this._addAction('toggle-explorer', () => this._toggleExplorer());
+        this._addAction('toggle-console', () => this._toggleConsole());
+        this._addAction('toggle-preview', () => {
+            if (this._previewButton)
+                this._previewButton.active = !this._previewButton.active;
+        });
+        this._addAction('toggle-theme', () => this.toggleTheme());
+        this._addAction('custom-theme', () => this.openCustomThemeDialog());
+        this._addAction('quit', () => this.close());
+
+        const app = this.get_application();
+        app.set_accels_for_action('win.new-tab', ['<Primary>n']);
+        app.set_accels_for_action('win.open', ['<Primary>o']);
+        app.set_accels_for_action('win.open-folder', ['<Primary><Shift>o']);
+        // SSH accelerator disabled with the feature.
+        app.set_accels_for_action('win.save', ['<Primary>s']);
+        app.set_accels_for_action('win.save-as', ['<Primary><Shift>s']);
+        app.set_accels_for_action('win.close-tab', ['<Primary>w']);
+        app.set_accels_for_action('win.next-tab', ['<Primary>Page_Down']);
+        app.set_accels_for_action('win.previous-tab', ['<Primary>Page_Up']);
+        app.set_accels_for_action('win.toggle-explorer', ['<Primary><Shift>e']);
+        app.set_accels_for_action('win.toggle-console', ['<Primary><Shift>j']);
+        app.set_accels_for_action('win.toggle-preview', ['<Primary><Shift>p']);
+        app.set_accels_for_action('win.toggle-theme', ['<Primary><Shift>t']);
+        app.set_accels_for_action('win.custom-theme', ['<Primary><Shift>c']);
+        app.set_accels_for_action('win.quit', ['<Primary>q']);
+    }
+
+    _addAction(name, callback) {
+        const action = new Gio.SimpleAction({name});
+        action.connect('activate', callback);
+        this.add_action(action);
+    }
+
+    _setStatus(message) {
+        if (!this._status)
+            return;
+        this._status.label = message;
+    }
+
+    _applyCustomCss() {
+        const cssData = buildCustomCss(this._customTheme);
+        this._customCss.load_from_data(cssData, cssData.length);
+    }
+
+    _saveSettings() {
+        saveSettings({
+            theme: this._theme,
+            customTheme: this._customTheme,
+        });
+    }
+
+    setTheme(theme, announce = true, persist = true) {
+        if (!THEMES[theme])
+            theme = DEFAULT_THEME;
+
+        for (const name in THEMES)
+            this.remove_css_class(THEMES[name].className);
+
+        this.add_css_class(THEMES[theme].className);
+        this._theme = theme;
+
+        const isDark = theme === 'dark' ||
+            (theme === 'custom' && isDarkHexColor(this._customTheme.editorBackground));
+        const settings = Gtk.Settings.get_default();
+        if (settings)
+            settings.gtk_application_prefer_dark_theme = isDark;
+
+        if (this._themeButton) {
+            this._themeButton.icon_name = THEMES[theme].icon;
+            this._themeButton.tooltip_text = `Theme: ${THEMES[theme].label}`;
+        }
+
+        if (announce)
+            this._setStatus(THEMES[theme].status);
+
+        this._applySourceSchemeToAllTabs();
+
+        if (persist)
+            this._saveSettings();
+    }
+
+    toggleTheme() {
+        const current = THEME_ORDER.indexOf(this._theme);
+        const next = THEME_ORDER[(current + 1) % THEME_ORDER.length];
+        this.setTheme(next);
+    }
+
+    openCustomThemeDialog() {
+        const dialog = new Gtk.Dialog({
+            title: 'Custom Theme',
+            transient_for: this,
+            modal: true,
+            default_width: 420,
+        });
+        dialog.add_button('Cancel', Gtk.ResponseType.CANCEL);
+        dialog.add_button('Apply', Gtk.ResponseType.ACCEPT);
+
+        const content = dialog.get_content_area();
+        content.margin_top = 12;
+        content.margin_bottom = 12;
+        content.margin_start = 12;
+        content.margin_end = 12;
+
+        const grid = new Gtk.Grid({
+            row_spacing: 8,
+            column_spacing: 12,
+        });
+        content.append(grid);
+
+        const entries = {};
+        CUSTOM_THEME_FIELDS.forEach(([key, label], row) => {
+            const fieldLabel = new Gtk.Label({
+                label,
+                xalign: 0,
+                halign: Gtk.Align.START,
+            });
+            const entry = new Gtk.Entry({
+                text: this._customTheme[key],
+                width_chars: 10,
+                max_width_chars: 10,
+                hexpand: true,
+            });
+            entries[key] = entry;
+            grid.attach(fieldLabel, 0, row, 1, 1);
+            grid.attach(entry, 1, row, 1, 1);
+        });
+
+        dialog.connect('response', (_dialog, response) => {
+            if (response === Gtk.ResponseType.ACCEPT) {
+                const nextTheme = {};
+                for (const [key, label] of CUSTOM_THEME_FIELDS) {
+                    const normalized = normalizeHexColor(entries[key].text);
+                    if (!normalized) {
+                        this._setStatus(`Invalid hex color: ${label}`);
+                        entries[key].grab_focus();
+                        return;
+                    }
+                    nextTheme[key] = normalized;
+                }
+
+                this._customTheme = nextTheme;
+                this._applyCustomCss();
+                this.setTheme('custom');
+            }
+
+            dialog.destroy();
+        });
+
+        dialog.present();
+    }
+
+    _bufferText(tab = this._currentTab()) {
+        if (!tab)
+            return '';
+
+        const start = tab.buffer.get_start_iter();
+        const end = tab.buffer.get_end_iter();
+        return tab.buffer.get_text(start, end, true);
+    }
+
+    _updateTitle() {
+        const tab = this._currentTab();
+        if (!tab) {
+            this.title = 'Native Code Editor';
+            this._titleLabel.label = 'Native Code Editor';
+            return;
+        }
+
+        const marker = tab.dirty ? '*' : '';
+        const name = `${this._tabName(tab)}${marker}`;
+        this.title = `${name} - Native Code Editor`;
+        this._titleLabel.label = name;
+    }
+
+    loadFile(file) {
+        try {
+            const [, contents] = file.load_contents(null);
+            let tab = this._currentTab();
+            if (!this._isReusableBlankTab(tab))
+                tab = this._createTab({announce: false});
+
+            tab.loading = true;
+            tab.buffer.set_text(ByteArray.toString(contents), -1);
+            tab.loading = false;
+            tab.file = file;
+            tab.dirty = false;
+            this._applyLanguageForTab(tab);
+            this._applySourceSchemeForTab(tab);
+            this._updateTabLabel(tab);
+            this._updateTitle();
+            this._setStatus(`Opened ${file.get_parse_name()}`);
+            this._updatePreviewVisibility();
+            tab.view.grab_focus();
+        } catch (error) {
+            this._setStatus(`Open failed: ${error.message}`);
+        }
+    }
+
+    loadRemoteFile(remotePath) {
+        if (!this._remote)
+            return;
+
+        const remote = {...this._remote};
+        this._runRemoteCommandAsync(
+            `cat -- ${shellQuote(remotePath)}`,
+            null,
+            remote,
+            `Opening ${remote.target}:${remotePath}...`,
+            (ok, stdout, stderr, status) => {
+                if (!ok || status !== 0) {
+                    this._setStatus(`SSH open failed: ${stderr.trim() || `exit ${status}`}`);
+                    return;
+                }
+
+                let tab = this._currentTab();
+                if (!this._isReusableBlankTab(tab))
+                    tab = this._createTab({announce: false});
+
+                tab.loading = true;
+                tab.buffer.set_text(stdout, -1);
+                tab.loading = false;
+                tab.file = null;
+                tab.remote = remote;
+                tab.remotePath = remotePath;
+                tab.dirty = false;
+                this._applyLanguageForTab(tab);
+                this._applySourceSchemeForTab(tab);
+                this._updateTabLabel(tab);
+                this._updateTitle();
+                this._setStatus(`Opened ${this._tabLocation(tab)}`);
+                this._updatePreviewVisibility();
+                tab.view.grab_focus();
+            }
+        );
+    }
+
+    save(tab = this._currentTab()) {
+        if (!tab)
+            return;
+
+        if (tab.remotePath) {
+            this.saveRemote(tab);
+            return;
+        }
+
+        if (!tab.file) {
+            this.saveAsDialog(tab);
+            return;
+        }
+
+        try {
+            const bytes = ByteArray.fromString(this._bufferText(tab));
+            tab.file.replace_contents(
+                bytes,
+                null,
+                false,
+                Gio.FileCreateFlags.REPLACE_DESTINATION,
+                null
+            );
+            tab.dirty = false;
+            this._updateTabLabel(tab);
+            this._updateTitle();
+            this._setStatus(`Saved ${tab.file.get_parse_name()}`);
+            if (this._previewButton && this._previewButton.active && this._currentTab() === tab)
+                this._updatePreviewVisibility();
+        } catch (error) {
+            this._setStatus(`Save failed: ${error.message}`);
+        }
+    }
+
+    saveRemote(tab = this._currentTab()) {
+        if (!tab || !tab.remotePath || !tab.remote)
+            return;
+
+        const tmpPath = GLib.build_filenamev([
+            GLib.get_tmp_dir(),
+            `nce-remote-save-${GLib.uuid_string_random()}`,
+        ]);
+
+        try {
+            GLib.file_set_contents(tmpPath, this._bufferText(tab));
+            this._runProcessAsync(
+                [
+                    ...this._scpArgs(tab.remote),
+                    tmpPath,
+                    `${tab.remote.target}:${tab.remotePath}`,
+                ],
+                tab.remote,
+                `Saving ${this._tabLocation(tab)}...`,
+                (ok, stdout, stderr, status) => {
+                    try {
+                        Gio.File.new_for_path(tmpPath).delete(null);
+                    } catch (_error) {
+                        // Best effort cleanup.
+                    }
+
+                    if (ok && status === 0) {
+                        tab.dirty = false;
+                        this._updateTabLabel(tab);
+                        this._updateTitle();
+                        this._setStatus(`Saved ${this._tabLocation(tab)}`);
+                        if (this._previewButton && this._previewButton.active && this._currentTab() === tab)
+                            this._updatePreviewVisibility();
+                    } else {
+                        this._setStatus(`SSH save failed: ${stderr.trim() || stdout.trim() || `exit ${status}`}`);
+                    }
+                }
+            );
+        } catch (error) {
+            this._setStatus(`SSH save failed: ${error.message}`);
+        }
+    }
+
+    openDialog() {
+        const dialog = new Gtk.FileChooserNative({
+            title: 'Open File',
+            transient_for: this,
+            modal: true,
+            action: Gtk.FileChooserAction.OPEN,
+            accept_label: 'Open',
+            cancel_label: 'Cancel',
+        });
+        dialog.connect('response', (_dialog, response) => {
+            if (response === Gtk.ResponseType.ACCEPT)
+                this.loadFile(dialog.get_file());
+            dialog.destroy();
+        });
+        dialog.show();
+    }
+
+    openFolderDialog() {
+        const dialog = new Gtk.FileChooserNative({
+            title: 'Open Folder',
+            transient_for: this,
+            modal: true,
+            action: Gtk.FileChooserAction.SELECT_FOLDER,
+            accept_label: 'Open',
+            cancel_label: 'Cancel',
+        });
+        try {
+            dialog.set_current_folder(this._workspaceDir);
+        } catch (_error) {
+            // Some portal backends do not allow setting an initial folder.
+        }
+        dialog.connect('response', (_dialog, response) => {
+            if (response === Gtk.ResponseType.ACCEPT) {
+                this._setWorkspaceDir(dialog.get_file());
+                this._setStatus(`Opened folder ${this._workspacePath()}`);
+            }
+            dialog.destroy();
+        });
+        dialog.show();
+    }
+
+    openSshDialog() {
+        const dialog = new Gtk.Dialog({
+            title: 'Connect over SSH',
+            transient_for: this,
+            modal: true,
+            default_width: 520,
+            default_height: 560,
+        });
+        dialog.add_button('Cancel', Gtk.ResponseType.CANCEL);
+        dialog.add_button('Connect', Gtk.ResponseType.ACCEPT);
+
+        const content = dialog.get_content_area();
+        content.margin_top = 12;
+        content.margin_bottom = 12;
+        content.margin_start = 12;
+        content.margin_end = 12;
+
+        const grid = new Gtk.Grid({
+            row_spacing: 8,
+            column_spacing: 12,
+        });
+        content.append(grid);
+
+        let authMode = SSH_AUTH_KEY;
+        let keyPath = null;
+
+        const hostEntry = new Gtk.Entry({
+            placeholder_text: 'example.com',
+            hexpand: true,
+        });
+        const userEntry = new Gtk.Entry({
+            text: GLib.get_user_name(),
+            placeholder_text: 'user',
+            hexpand: true,
+        });
+        const portEntry = new Gtk.Entry({
+            text: '22',
+            width_chars: 6,
+        });
+        const pathEntry = new Gtk.Entry({
+            text: '.',
+            placeholder_text: '/home/user/project',
+            hexpand: true,
+        });
+        const passwordEntry = new Gtk.Entry({
+            visibility: false,
+            input_purpose: Gtk.InputPurpose.PASSWORD,
+            placeholder_text: 'SSH password',
+            hexpand: true,
+        });
+
+        const fields = [
+            ['Host', hostEntry],
+            ['User', userEntry],
+            ['Port', portEntry],
+            ['Start path', pathEntry],
+        ];
+        fields.forEach(([label, entry], row) => {
+            grid.attach(new Gtk.Label({
+                label,
+                xalign: 0,
+                halign: Gtk.Align.START,
+            }), 0, row, 1, 1);
+            grid.attach(entry, 1, row, 1, 1);
+        });
+
+        const authLabel = new Gtk.Label({
+            label: 'Auth',
+            xalign: 0,
+            halign: Gtk.Align.START,
+        });
+        const authBox = new Gtk.Box({
+            orientation: Gtk.Orientation.HORIZONTAL,
+            spacing: 6,
+        });
+        const keyButton = new Gtk.ToggleButton({
+            label: 'Key',
+            active: true,
+        });
+        const passwordButton = new Gtk.ToggleButton({
+            label: 'Password',
+        });
+        authBox.append(keyButton);
+        authBox.append(passwordButton);
+        grid.attach(authLabel, 0, fields.length, 1, 1);
+        grid.attach(authBox, 1, fields.length, 1, 1);
+
+        const keyBox = new Gtk.Box({
+            orientation: Gtk.Orientation.HORIZONTAL,
+            spacing: 6,
+        });
+        const keyValue = new Gtk.Label({
+            label: 'Default SSH keys / agent',
+            xalign: 0,
+            hexpand: true,
+            ellipsize: 1,
+        });
+        keyValue.add_css_class('path-label');
+        const keyChooserButton = new Gtk.Button({
+            label: 'Select Key...',
+        });
+        keyChooserButton.connect('clicked', () => {
+            const keyDialog = new Gtk.FileChooserNative({
+                title: 'Select SSH Key',
+                transient_for: dialog,
+                modal: true,
+                action: Gtk.FileChooserAction.OPEN,
+                accept_label: 'Select',
+                cancel_label: 'Cancel',
+            });
+            try {
+                keyDialog.set_current_folder(Gio.File.new_for_path(GLib.build_filenamev([GLib.get_home_dir(), '.ssh'])));
+            } catch (_error) {
+                // Keep the chooser default if ~/.ssh cannot be selected.
+            }
+            keyDialog.connect('response', (_keyDialog, keyResponse) => {
+                if (keyResponse === Gtk.ResponseType.ACCEPT) {
+                    keyPath = filePathOrNull(keyDialog.get_file());
+                    keyValue.label = keyPath || 'Default SSH keys / agent';
+                }
+                keyDialog.destroy();
+            });
+            keyDialog.show();
+        });
+        keyBox.append(keyValue);
+        keyBox.append(keyChooserButton);
+        const keyFileLabel = new Gtk.Label({
+            label: 'Key file',
+            xalign: 0,
+            halign: Gtk.Align.START,
+        });
+        grid.attach(keyFileLabel, 0, fields.length + 1, 1, 1);
+        grid.attach(keyBox, 1, fields.length + 1, 1, 1);
+
+        const passwordLabel = new Gtk.Label({
+            label: 'Password',
+            xalign: 0,
+            halign: Gtk.Align.START,
+        });
+        grid.attach(passwordLabel, 0, fields.length + 2, 1, 1);
+        grid.attach(passwordEntry, 1, fields.length + 2, 1, 1);
+
+        const setAuthMode = mode => {
+            authMode = mode;
+            keyButton.active = mode === SSH_AUTH_KEY;
+            passwordButton.active = mode === SSH_AUTH_PASSWORD;
+            keyFileLabel.visible = mode === SSH_AUTH_KEY;
+            keyBox.visible = mode === SSH_AUTH_KEY;
+            passwordLabel.visible = mode === SSH_AUTH_PASSWORD;
+            passwordEntry.visible = mode === SSH_AUTH_PASSWORD;
+        };
+        keyButton.connect('clicked', () => setAuthMode(SSH_AUTH_KEY));
+        passwordButton.connect('clicked', () => setAuthMode(SSH_AUTH_PASSWORD));
+        setAuthMode(SSH_AUTH_KEY);
+
+        const note = new Gtk.Label({
+            label: 'Key auth uses your selected key or SSH agent. If the key is encrypted, the app will ask for the key password. Password auth is stored only in this running editor process.',
+            xalign: 0,
+            wrap: true,
+            margin_top: 6,
+        });
+        note.add_css_class('path-label');
+        grid.attach(note, 0, fields.length + 3, 2, 1);
+
+        dialog.connect('response', (_dialog, response) => {
+            if (response === Gtk.ResponseType.ACCEPT) {
+                const host = hostEntry.text.trim();
+                const user = userEntry.text.trim();
+                const port = Number.parseInt(portEntry.text.trim(), 10);
+                const startPath = pathEntry.text.trim() || '.';
+
+                if (!host || !Number.isFinite(port) || port <= 0) {
+                    this._setStatus('SSH needs a host and valid port');
+                    return;
+                }
+
+                const remote = {
+                    authMode,
+                    host,
+                    keyPath: authMode === SSH_AUTH_KEY ? keyPath : null,
+                    secret: authMode === SSH_AUTH_PASSWORD ? passwordEntry.text : null,
+                    user,
+                    port,
+                    target: user ? `${user}@${host}` : host,
+                };
+
+                this._connectRemote(
+                    remote,
+                    startPath,
+                    () => dialog.destroy(),
+                    stderr => {
+                        if (authMode === SSH_AUTH_KEY &&
+                            keyPath &&
+                            remote.secret === null &&
+                            looksLikeSshAuthFailure(stderr)) {
+                            this._promptSshSecret(
+                                'Key Password',
+                                `Enter the password for ${keyPath}`,
+                                secret => {
+                                    remote.secret = secret;
+                                    this._connectRemote(remote, startPath, () => dialog.destroy());
+                                }
+                            );
+                        }
+                    }
+                );
+            } else {
+                dialog.destroy();
+            }
+        });
+
+        dialog.present();
+        hostEntry.grab_focus();
+    }
+
+    _connectRemote(remote, startPath, onConnected = null, onFailed = null) {
+        this._runRemoteCommandAsync(
+            `cd -- ${shellQuote(startPath)} && pwd`,
+            null,
+            remote,
+            `Connecting to ${remote.target}...`,
+            (ok, stdout, stderr, status) => {
+                GLib.idle_add(GLib.PRIORITY_DEFAULT, () => {
+                    if (!ok || status !== 0) {
+                        this._setStatus(`SSH failed: ${stderr.trim() || `exit ${status}`}`);
+                        if (onFailed) {
+                            try {
+                                onFailed(stderr, status);
+                            } catch (error) {
+                                printerr(`SSH failure handler failed: ${error.message || error}`);
+                            }
+                        }
+                        return GLib.SOURCE_REMOVE;
+                    }
+
+                    this._remote = remote;
+                    this._remoteDir = stdout.trim().split('\n').pop() || startPath;
+                    GLib.idle_add(GLib.PRIORITY_DEFAULT, () => {
+                        try {
+                            printerr('SSH connect step: status');
+                            this._appendConsole(`SSH connected: ${this._remoteDisplayName(this._remoteDir)}\n`);
+                            this._setStatus(`SSH connected: ${this._remoteDisplayName(this._remoteDir)}`);
+                        } catch (error) {
+                            printerr(`SSH connect status failed: ${error.message || error}`);
+                        }
+                        GLib.idle_add(GLib.PRIORITY_DEFAULT, () => {
+                            printerr('SSH connect step: show explorer');
+                            try {
+                                this._setExplorerVisible(true);
+                            } catch (error) {
+                                printerr(`SSH explorer visibility failed: ${error.message || error}`);
+                            }
+                            if (onConnected) {
+                                try {
+                                    onConnected();
+                                } catch (error) {
+                                    printerr(`SSH connect handler failed: ${error.message || error}`);
+                                }
+                            }
+                            return GLib.SOURCE_REMOVE;
+                        });
+                        return GLib.SOURCE_REMOVE;
+                    });
+                    return GLib.SOURCE_REMOVE;
+                });
+            }
+        );
+    }
+
+    _promptSshSecret(title, message, callback) {
+        const dialog = new Gtk.Dialog({
+            title,
+            transient_for: this,
+            modal: true,
+            default_width: 420,
+            default_height: 180,
+        });
+        dialog.add_button('Cancel', Gtk.ResponseType.CANCEL);
+        dialog.add_button('Connect', Gtk.ResponseType.ACCEPT);
+
+        const content = dialog.get_content_area();
+        content.margin_top = 12;
+        content.margin_bottom = 12;
+        content.margin_start = 12;
+        content.margin_end = 12;
+
+        const label = new Gtk.Label({
+            label: message,
+            xalign: 0,
+            wrap: true,
+            margin_bottom: 8,
+        });
+        content.append(label);
+
+        const entry = new Gtk.Entry({
+            visibility: false,
+            input_purpose: Gtk.InputPurpose.PASSWORD,
+            hexpand: true,
+        });
+        content.append(entry);
+
+        dialog.connect('response', (_dialog, response) => {
+            if (response === Gtk.ResponseType.ACCEPT)
+                callback(entry.text);
+            dialog.destroy();
+        });
+
+        dialog.present();
+        entry.grab_focus();
+    }
+
+    saveAsDialog(tab = this._currentTab()) {
+        if (!tab)
+            return;
+
+        if (tab.remotePath) {
+            this.saveRemoteAsDialog(tab);
+            return;
+        }
+
+        const dialog = new Gtk.FileChooserNative({
+            title: 'Save File',
+            transient_for: this,
+            modal: true,
+            action: Gtk.FileChooserAction.SAVE,
+            accept_label: 'Save',
+            cancel_label: 'Cancel',
+        });
+        if (tab.file)
+            dialog.set_file(tab.file);
+        dialog.connect('response', (_dialog, response) => {
+            if (response === Gtk.ResponseType.ACCEPT) {
+                tab.file = dialog.get_file();
+                this._applyLanguageForTab(tab);
+                this._applySourceSchemeForTab(tab);
+                this._updateTabLabel(tab);
+                this.save(tab);
+                this._updatePreviewVisibility();
+            }
+            dialog.destroy();
+        });
+        dialog.show();
+    }
+
+    saveRemoteAsDialog(tab = this._currentTab()) {
+        if (!tab || !tab.remotePath)
+            return;
+
+        const dialog = new Gtk.Dialog({
+            title: 'Save Remote File As',
+            transient_for: this,
+            modal: true,
+            default_width: 520,
+        });
+        dialog.add_button('Cancel', Gtk.ResponseType.CANCEL);
+        dialog.add_button('Save', Gtk.ResponseType.ACCEPT);
+
+        const content = dialog.get_content_area();
+        content.margin_top = 12;
+        content.margin_bottom = 12;
+        content.margin_start = 12;
+        content.margin_end = 12;
+
+        const label = new Gtk.Label({
+            label: `${tab.remote.target}:`,
+            xalign: 0,
+            margin_bottom: 8,
+        });
+        content.append(label);
+
+        const entry = new Gtk.Entry({
+            text: tab.remotePath,
+            hexpand: true,
+        });
+        content.append(entry);
+
+        dialog.connect('response', (_dialog, response) => {
+            if (response === Gtk.ResponseType.ACCEPT) {
+                const nextPath = entry.text.trim();
+                if (!nextPath.startsWith('/')) {
+                    this._setStatus('Remote Save As needs an absolute path');
+                    return;
+                }
+
+                tab.remotePath = nextPath;
+                this._applyLanguageForTab(tab);
+                this._updateTabLabel(tab);
+                this.saveRemote(tab);
+            }
+
+            dialog.destroy();
+        });
+
+        dialog.present();
+        entry.grab_focus();
+    }
+});
+
+const app = new Gtk.Application({
+    application_id: APP_ID,
+    flags: Gio.ApplicationFlags.HANDLES_OPEN,
+});
+
+app.connect('activate', application => {
+    const win = new EditorWindow(application);
+    win.present();
+});
+
+app.connect('open', (application, files) => {
+    const win = new EditorWindow(application);
+    for (const file of files)
+        win.loadFile(file);
+    win.present();
+});
+
+app.run(ARGV);
