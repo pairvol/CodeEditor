@@ -120,6 +120,10 @@ code intelligence can build on this base.
 - Richer SSH remote support: create, rename, and delete files/folders on the
   remote host (currently limited to browse/open/save)
 
+## Feedback
+
+Have thoughts on Native Code Editor? [Take the survey](https://tally.so/r/Y5g6JJ).
+
 ## License
 
 MIT. See [LICENSE](LICENSE).

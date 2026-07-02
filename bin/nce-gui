@@ -456,6 +456,7 @@ class EditorWindow extends Gtk.ApplicationWindow {
         this._titleLabel = new Gtk.Label({
             label: 'Native Code Editor',
             single_line_mode: true,
+            width_chars: 8,
             ellipsize: 3,
         });
         header.set_title_widget(this._titleLabel);
@@ -733,11 +734,18 @@ class EditorWindow extends Gtk.ApplicationWindow {
                 this.newTab(false);
         });
         this._notebook.connect('switch-page', () => {
-            this._updateTitle();
-            this._updatePreviewVisibility();
-            const tab = this._currentTab();
-            if (tab)
-                this._setStatus(`Editing ${this._tabLocation(tab)}`);
+            // GTK fires switch-page before get_current_page() reflects the
+            // new page, so anything reading _currentTab() here would still
+            // see the tab being switched away from. Defer one tick so the
+            // notebook's current-page state has actually settled.
+            GLib.idle_add(GLib.PRIORITY_DEFAULT, () => {
+                this._updateTitle();
+                this._updatePreviewVisibility();
+                const tab = this._currentTab();
+                if (tab)
+                    this._setStatus(`Editing ${this._tabLocation(tab)}`);
+                return GLib.SOURCE_REMOVE;
+            });
         });
         this._notebook.connect('create-window', () => {
             const newWin = new EditorWindow(this.get_application());
@@ -1491,6 +1499,7 @@ class EditorWindow extends Gtk.ApplicationWindow {
 
         tab.titleLabel = new Gtk.Label({
             xalign: 0,
+            width_chars: 8,
             max_width_chars: 24,
             ellipsize: 3,
         });
