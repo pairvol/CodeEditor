@@ -63,7 +63,6 @@ Windowed app:
 - `Ctrl-Page Up` / `Ctrl-Page Down`: switch tabs
 - `Ctrl-Shift-E`: toggle file explorer
 - `Ctrl-Shift-J`: toggle console
-- `` Ctrl-` ``: toggle terminal
 - `Ctrl-Shift-K`: connect over SSH
 - `Ctrl-Shift-P`: toggle live preview for HTML/PHP tabs
 - `Ctrl-Shift-T`: cycle dark/light/custom theme
@@ -87,11 +86,13 @@ are marked with `*` and must be saved before closing.
 - Initial language support: JavaScript (`.js`, `.mjs`, `.cjs`), HTML, CSS, and
   PHP
 - Toggleable bottom console for running one-off shell commands in the
-  workspace, plus a separate real interactive terminal (VTE-backed) in the
-  same panel
+  workspace
 - Drag a tab out of the tab bar to tear it off into its own window
 - WebKitGTK live preview for HTML tabs
 - PHP preview uses the saved file and requires a `php` command on `PATH`
+- Inline spell-check (red underlines) using the system's default spelling
+  language (`libspelling`, tied to your GNOME input source / keyboard
+  layout). Falls back to no spell-check if `libspelling` isn't installed.
 
 ## Terminal Editor
 
@@ -106,11 +107,11 @@ are marked with `*` and must be saved before closing.
 ## Scope
 
 Current scope: tabbed code editing with tab tear-off into new windows, file
-explorer, quick open, shell console, an embedded terminal, JS/HTML/CSS and PHP
-syntax highlighting, HTML/PHP preview, file open/save/save-as,
-dark/light/custom themes, dirty state in the title and tab labels, SSH remote
-editing, and native desktop launcher metadata. Richer project tools and deeper
-code intelligence can build on this base.
+explorer, quick open, shell console, spell-check, JS/HTML/CSS and PHP syntax
+highlighting, HTML/PHP preview, file open/save/save-as, dark/light/custom
+themes, dirty state in the title and tab labels, SSH remote editing, and
+native desktop launcher metadata. Richer project tools and deeper code
+intelligence can build on this base.
 
 ## Planned Features
 

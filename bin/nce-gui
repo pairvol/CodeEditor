@@ -9,6 +9,22 @@ imports.gi.versions.Vte = '3.91';
 const {Gdk, Gio, GLib, GObject, Gtk, GtkSource, Vte, WebKit} = imports.gi;
 const ByteArray = imports.byteArray;
 
+// Spell-check (libspelling) is an optional dependency: fall back to no
+// spell-check rather than crashing if it isn't installed. The default
+// checker picks up the user's configured spelling language (tied to their
+// input source / keyboard layout in GNOME Settings) automatically.
+let Spelling = null;
+let SPELLING_CHECKER = null;
+try {
+    imports.gi.versions.Spelling = '1';
+    Spelling = imports.gi.Spelling;
+    Spelling.init();
+    SPELLING_CHECKER = Spelling.Checker.get_default();
+} catch (_error) {
+    Spelling = null;
+    SPELLING_CHECKER = null;
+}
+
 const APP_ID = GLib.getenv('NCE_APP_ID') || 'dev.pairvol.NativeCodeEditor';
 const CONFIG_DIR = GLib.build_filenamev([GLib.get_user_config_dir(), 'native-code-editor']);
 const CONFIG_FILE = GLib.build_filenamev([CONFIG_DIR, 'settings.json']);
@@ -24,6 +40,9 @@ const LANGUAGE_BY_EXTENSION = {
     php: 'php',
 };
 const PREVIEW_EXTENSIONS = new Set(['html', 'htm', 'php']);
+// The embedded VTE terminal is broken on this branch. Hidden until fixed;
+// flip back to true to re-enable the tab, button wording, and shortcut.
+const TERMINAL_ENABLED = false;
 const EXPLORER_MAX_ITEMS = 700;
 const QUICK_FINDER_SKIP_DIRS = new Set(['.git', '.svn', '.hg', 'node_modules', 'dist', 'build', '__pycache__']);
 const QUICK_FINDER_MAX_FILES = 4000;
@@ -397,8 +416,8 @@ class EditorWindow extends Gtk.ApplicationWindow {
         header.pack_start(saveButton);
 
         this._consoleButton = new Gtk.ToggleButton({
-            icon_name: 'utilities-terminal-symbolic',
-            tooltip_text: 'Toggle Console/Terminal',
+            icon_name: TERMINAL_ENABLED ? 'utilities-terminal-symbolic' : 'applications-utilities-symbolic',
+            tooltip_text: TERMINAL_ENABLED ? 'Toggle Console/Terminal' : 'Toggle Console',
         });
         this._consoleButton.connect('toggled', () => {
             this._setConsoleVisible(this._consoleButton.active, false);
@@ -768,7 +787,8 @@ class EditorWindow extends Gtk.ApplicationWindow {
             vexpand: true,
         });
         this._bottomNotebook.append_page(this._buildConsolePanel(), new Gtk.Label({label: 'Console'}));
-        this._bottomNotebook.append_page(this._buildTerminalPanel(), new Gtk.Label({label: 'Terminal'}));
+        if (TERMINAL_ENABLED)
+            this._bottomNotebook.append_page(this._buildTerminalPanel(), new Gtk.Label({label: 'Terminal'}));
         return this._bottomNotebook;
     }
 
@@ -1517,6 +1537,18 @@ class EditorWindow extends Gtk.ApplicationWindow {
         });
         view.add_css_class('editor');
 
+        let spellingAdapter = null;
+        if (Spelling) {
+            try {
+                spellingAdapter = new Spelling.TextBufferAdapter({buffer, checker: SPELLING_CHECKER});
+                spellingAdapter.set_enabled(true);
+                view.insert_action_group('spelling', spellingAdapter);
+            } catch (error) {
+                printerr(`Spell-check setup failed: ${error.message || error}`);
+                spellingAdapter = null;
+            }
+        }
+
         const scroller = new Gtk.ScrolledWindow({
             hexpand: true,
             vexpand: true,
@@ -1527,6 +1559,7 @@ class EditorWindow extends Gtk.ApplicationWindow {
             buffer,
             view,
             scroller,
+            spellingAdapter,
             file,
             remote,
             remotePath,
@@ -1567,6 +1600,8 @@ class EditorWindow extends Gtk.ApplicationWindow {
             tab.loading = true;
             buffer.set_text(text, -1);
             tab.loading = false;
+            if (spellingAdapter)
+                spellingAdapter.invalidate_all();
         }
 
         this._notebook.set_current_page(pageNum);
@@ -2087,7 +2122,8 @@ class EditorWindow extends Gtk.ApplicationWindow {
         this._addAction('previous-tab', () => this.selectPreviousTab());
         this._addAction('toggle-explorer', () => this._toggleExplorer());
         this._addAction('toggle-console', () => this._toggleConsole());
-        this._addAction('toggle-terminal', () => this._toggleTerminal());
+        if (TERMINAL_ENABLED)
+            this._addAction('toggle-terminal', () => this._toggleTerminal());
         this._addAction('toggle-preview', () => {
             if (this._previewButton)
                 this._previewButton.active = !this._previewButton.active;
@@ -2109,7 +2145,8 @@ class EditorWindow extends Gtk.ApplicationWindow {
         app.set_accels_for_action('win.previous-tab', ['<Primary>Page_Up']);
         app.set_accels_for_action('win.toggle-explorer', ['<Primary><Shift>e']);
         app.set_accels_for_action('win.toggle-console', ['<Primary><Shift>j']);
-        app.set_accels_for_action('win.toggle-terminal', ['<Primary>grave']);
+        if (TERMINAL_ENABLED)
+            app.set_accels_for_action('win.toggle-terminal', ['<Primary>grave']);
         app.set_accels_for_action('win.toggle-preview', ['<Primary><Shift>p']);
         app.set_accels_for_action('win.toggle-theme', ['<Primary><Shift>t']);
         app.set_accels_for_action('win.custom-theme', ['<Primary><Shift>c']);
@@ -2273,6 +2310,8 @@ class EditorWindow extends Gtk.ApplicationWindow {
             tab.loading = true;
             tab.buffer.set_text(ByteArray.toString(contents), -1);
             tab.loading = false;
+            if (tab.spellingAdapter)
+                tab.spellingAdapter.invalidate_all();
             tab.file = file;
             tab.dirty = false;
             this._applyLanguageForTab(tab);
@@ -2310,6 +2349,8 @@ class EditorWindow extends Gtk.ApplicationWindow {
                 tab.loading = true;
                 tab.buffer.set_text(stdout, -1);
                 tab.loading = false;
+                if (tab.spellingAdapter)
+                    tab.spellingAdapter.invalidate_all();
                 tab.file = null;
                 tab.remote = remote;
                 tab.remotePath = remotePath;
