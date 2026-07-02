@@ -12,6 +12,19 @@ The repository contains two editors:
 The GTK editor is the main app. It supports opening, editing, and saving files
 over SSH in addition to local files.
 
+## Extensions (early)
+
+Drop `.js` files into `~/.config/native-code-editor/extensions/` and they run
+once at startup, in filename-sort order, each with the running
+`Gtk.Application` instance in scope as `app`. A script's top-level code is its
+entire entry point — there's no registration contract, lifecycle, or
+sandboxing yet. A script can reach into `app.get_windows()` to touch a live
+editor window directly (add header buttons, register actions, etc.), but
+expect the internals it pokes at to change without notice at this stage.
+
+A failing extension is logged to stderr and skipped; it does not stop other
+extensions from loading or crash the app.
+
 ## Build
 
 ```sh
@@ -106,11 +119,11 @@ are marked with `*` and must be saved before closing.
 ## Scope
 
 Current scope: tabbed code editing with tab tear-off into new windows, file
-explorer, quick open, shell console, an embedded terminal, JS/HTML/CSS and PHP
-syntax highlighting, HTML/PHP preview, file open/save/save-as,
-dark/light/custom themes, dirty state in the title and tab labels, SSH remote
-editing, and native desktop launcher metadata. Richer project tools and deeper
-code intelligence can build on this base.
+explorer, quick open, shell console, an embedded terminal, an early extension
+loader, JS/HTML/CSS and PHP syntax highlighting, HTML/PHP preview, file
+open/save/save-as, dark/light/custom themes, dirty state in the title and tab
+labels, SSH remote editing, and native desktop launcher metadata. Richer
+project tools and deeper code intelligence can build on this base.
 
 ## Planned Features
 
