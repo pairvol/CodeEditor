@@ -4,8 +4,9 @@ imports.gi.versions.Gtk = '4.0';
 imports.gi.versions.Gdk = '4.0';
 imports.gi.versions.GtkSource = '5';
 imports.gi.versions.WebKit = '6.0';
+imports.gi.versions.Vte = '3.91';
 
-const {Gdk, Gio, GLib, GObject, Gtk, GtkSource, WebKit} = imports.gi;
+const {Gdk, Gio, GLib, GObject, Gtk, GtkSource, Vte, WebKit} = imports.gi;
 const ByteArray = imports.byteArray;
 
 const APP_ID = GLib.getenv('NCE_APP_ID') || 'dev.pairvol.NativeCodeEditor';
@@ -24,6 +25,9 @@ const LANGUAGE_BY_EXTENSION = {
 };
 const PREVIEW_EXTENSIONS = new Set(['html', 'htm', 'php']);
 const EXPLORER_MAX_ITEMS = 700;
+const QUICK_FINDER_SKIP_DIRS = new Set(['.git', '.svn', '.hg', 'node_modules', 'dist', 'build', '__pycache__']);
+const QUICK_FINDER_MAX_FILES = 4000;
+const QUICK_FINDER_MAX_RESULTS = 200;
 const SSH_CONNECT_TIMEOUT_SECONDS = 8;
 const SSH_AUTH_KEY = 'key';
 const SSH_AUTH_PASSWORD = 'password';
@@ -200,6 +204,31 @@ function escapeHtml(text) {
         .replaceAll('"', '&quot;');
 }
 
+function fuzzyScore(query, text) {
+    const q = query.toLowerCase();
+    const t = text.toLowerCase();
+    let qi = 0;
+    let score = 0;
+    let consecutive = 0;
+    for (let ti = 0; ti < t.length && qi < q.length; ti++) {
+        if (t[ti] === q[qi]) {
+            score += 1 + consecutive * 2;
+            consecutive++;
+            qi++;
+        } else {
+            consecutive = 0;
+        }
+    }
+    if (qi < q.length)
+        return null;
+
+    score += Math.max(0, 20 - text.length * 0.05);
+    const baseName = t.slice(t.lastIndexOf('/') + 1);
+    if (baseName.includes(q))
+        score += 15;
+    return score;
+}
+
 function looksLikeSshAuthFailure(stderr) {
     const text = String(stderr || '').toLowerCase();
     return text.includes('permission denied') ||
@@ -334,11 +363,12 @@ class EditorWindow extends Gtk.ApplicationWindow {
         const header = new Gtk.HeaderBar();
         this.set_titlebar(header);
 
-        const newTabButton = new Gtk.Button({
+        this._newPopover = this._buildNewPopover();
+        const newTabButton = new Gtk.MenuButton({
             icon_name: 'document-new-symbolic',
-            tooltip_text: 'New Tab',
+            tooltip_text: 'New',
+            popover: this._newPopover,
         });
-        newTabButton.connect('clicked', () => this.newTab());
         header.pack_start(newTabButton);
 
         const openButton = new Gtk.Button({
@@ -354,6 +384,13 @@ class EditorWindow extends Gtk.ApplicationWindow {
         });
         openFolderButton.connect('clicked', () => this.openFolderDialog());
         header.pack_start(openFolderButton);
+
+        const quickOpenButton = new Gtk.Button({
+            icon_name: 'system-search-symbolic',
+            tooltip_text: 'Quick Open (Ctrl+P)',
+        });
+        quickOpenButton.connect('clicked', () => this.openQuickFinder());
+        header.pack_start(quickOpenButton);
 
         this._explorerButton = new Gtk.ToggleButton({
             icon_name: 'sidebar-show-symbolic',
@@ -387,6 +424,13 @@ class EditorWindow extends Gtk.ApplicationWindow {
             this._setConsoleVisible(this._consoleButton.active, false);
         });
         header.pack_end(this._consoleButton);
+
+        const terminalButton = new Gtk.Button({
+            icon_name: 'utilities-terminal-symbolic',
+            tooltip_text: 'Toggle Terminal (Ctrl+`)',
+        });
+        terminalButton.connect('clicked', () => this._toggleTerminal());
+        header.pack_end(terminalButton);
 
         this._busySpinner = new Gtk.Spinner({
             visible: false,
@@ -681,12 +725,37 @@ class EditorWindow extends Gtk.ApplicationWindow {
             scrollable: true,
         });
         this._notebook.add_css_class('editor-tabs');
+        this._notebook.set_group_name('nce-editor-tabs');
+        this._notebook.connect('page-removed', () => {
+            // Covers both closeTab() and a tab being dragged out into a new
+            // window, so a window is never left with zero tabs.
+            if (!this._suppressAutoNewTab && this._notebook.get_n_pages() === 0)
+                this.newTab(false);
+        });
         this._notebook.connect('switch-page', () => {
             this._updateTitle();
             this._updatePreviewVisibility();
             const tab = this._currentTab();
             if (tab)
                 this._setStatus(`Editing ${this._tabLocation(tab)}`);
+        });
+        this._notebook.connect('create-window', () => {
+            const newWin = new EditorWindow(this.get_application());
+            // Remove the window's default blank tab directly (not via
+            // _removeTab, which would immediately refill it with another
+            // blank tab once the notebook is empty) so only the dragged
+            // tab ends up in the new window.
+            const blankTab = newWin._currentTab();
+            if (blankTab) {
+                const pageNum = newWin._pageNumForTab(blankTab);
+                if (pageNum >= 0) {
+                    newWin._suppressAutoNewTab = true;
+                    newWin._notebook.remove_page(pageNum);
+                    newWin._suppressAutoNewTab = false;
+                }
+            }
+            newWin.present();
+            return newWin._notebook;
         });
 
         this._previewPanel = this._buildPreviewPanel();
@@ -697,12 +766,86 @@ class EditorWindow extends Gtk.ApplicationWindow {
         this._editorPreviewPaned.set_position(650);
 
         this._workspacePaned.set_start_child(this._editorPreviewPaned);
-        this._consolePanel = this._buildConsolePanel();
+        this._consolePanel = this._buildBottomPanel();
         this._consolePanel.visible = false;
         this._workspacePaned.set_end_child(this._consolePanel);
         this._workspacePaned.set_position(480);
 
         return this._workspacePaned;
+    }
+
+    _buildBottomPanel() {
+        this._bottomNotebook = new Gtk.Notebook({
+            hexpand: true,
+            vexpand: true,
+        });
+        this._bottomNotebook.append_page(this._buildConsolePanel(), new Gtk.Label({label: 'Console'}));
+        this._bottomNotebook.append_page(this._buildTerminalPanel(), new Gtk.Label({label: 'Terminal'}));
+        return this._bottomNotebook;
+    }
+
+    _buildTerminalPanel() {
+        const panel = new Gtk.Box({
+            orientation: Gtk.Orientation.VERTICAL,
+            spacing: 0,
+        });
+        panel.add_css_class('console-panel');
+
+        this._terminal = new Vte.Terminal({
+            hexpand: true,
+            vexpand: true,
+        });
+        this._terminalSpawned = false;
+
+        const scroller = new Gtk.ScrolledWindow({
+            hexpand: true,
+            vexpand: true,
+            child: this._terminal,
+        });
+        panel.append(scroller);
+
+        return panel;
+    }
+
+    _ensureTerminalSpawned() {
+        if (this._terminalSpawned)
+            return;
+        this._terminalSpawned = true;
+
+        const shell = GLib.getenv('SHELL') || '/bin/bash';
+        const cwd = filePathOrNull(this._workspaceDir) || GLib.get_home_dir();
+        try {
+            this._terminal.spawn_async(
+                Vte.PtyFlags.DEFAULT,
+                cwd,
+                [shell],
+                null,
+                GLib.SpawnFlags.SEARCH_PATH,
+                null,
+                -1,
+                null,
+                (_terminal, _pid, error) => {
+                    if (error)
+                        this._setStatus(`Terminal failed to start: ${error.message}`);
+                }
+            );
+        } catch (error) {
+            this._setStatus(`Terminal failed to start: ${error.message}`);
+        }
+    }
+
+    _toggleTerminal() {
+        const alreadyShowingTerminal = this._consolePanel.visible &&
+            this._bottomNotebook.get_current_page() === 1;
+        if (alreadyShowingTerminal) {
+            this._setConsoleVisible(false);
+            return;
+        }
+
+        this._setConsoleVisible(true);
+        this._bottomNotebook.set_current_page(1);
+        this._ensureTerminalSpawned();
+        this._terminal.grab_focus();
     }
 
     _buildPreviewPanel() {
@@ -1032,6 +1175,9 @@ class EditorWindow extends Gtk.ApplicationWindow {
         if (syncButton && this._consoleButton)
             this._consoleButton.active = visible;
 
+        if (visible && this._bottomNotebook)
+            this._bottomNotebook.set_current_page(0);
+
         if (visible && this._consoleEntry)
             this._consoleEntry.grab_focus();
 
@@ -1356,7 +1502,7 @@ class EditorWindow extends Gtk.ApplicationWindow {
         });
         closeButton.add_css_class('flat');
         closeButton.add_css_class('tab-close');
-        closeButton.connect('clicked', () => this.closeTab(tab));
+        closeButton.connect('clicked', () => tab.scroller.get_root().closeTab(tab));
         box.append(closeButton);
 
         return box;
@@ -1407,18 +1553,24 @@ class EditorWindow extends Gtk.ApplicationWindow {
         scroller._nceTab = tab;
         const pageNum = this._notebook.append_page(scroller, this._buildTabLabel(tab));
         this._notebook.set_tab_reorderable(scroller, true);
+        this._notebook.set_tab_detachable(scroller, true);
 
         buffer.connect('changed', () => {
             if (tab.loading)
                 return;
 
             tab.dirty = true;
-            this._updateTabLabel(tab);
-            if (this._currentTab() === tab) {
-                this._updateTitle();
-                this._setStatus('Modified');
-                if (this._previewButton && this._previewButton.active && this._isPreviewableTab(tab))
-                    this._refreshPreview();
+            // A torn-off tab moves to a different window's notebook, so the
+            // owning window must be resolved at call time rather than
+            // captured here, or it would keep updating the window this tab
+            // used to belong to.
+            const win = tab.scroller.get_root();
+            win._updateTabLabel(tab);
+            if (win._currentTab() === tab) {
+                win._updateTitle();
+                win._setStatus('Modified');
+                if (win._previewButton && win._previewButton.active && win._isPreviewableTab(tab))
+                    win._refreshPreview();
             }
         });
 
@@ -1477,15 +1629,10 @@ class EditorWindow extends Gtk.ApplicationWindow {
             return;
 
         this._notebook.remove_page(pageNum);
-        if (this._notebook.get_n_pages() === 0) {
-            this.newTab(false);
-            this._setStatus('New tab');
-        } else {
-            this._updateTitle();
-            const current = this._currentTab();
-            if (current)
-                this._setStatus(`Editing ${this._tabLocation(current)}`);
-        }
+        this._updateTitle();
+        const current = this._currentTab();
+        if (current)
+            this._setStatus(`Editing ${this._tabLocation(current)}`);
     }
 
     selectNextTab() {
@@ -1785,6 +1932,42 @@ class EditorWindow extends Gtk.ApplicationWindow {
         );
     }
 
+    _buildNewPopover() {
+        const popover = new Gtk.Popover();
+        const box = new Gtk.Box({
+            orientation: Gtk.Orientation.VERTICAL,
+            spacing: 4,
+            margin_top: 8,
+            margin_bottom: 8,
+            margin_start: 8,
+            margin_end: 8,
+        });
+        popover.set_child(box);
+
+        const newTabButton = new Gtk.Button({
+            label: 'New Tab',
+            halign: Gtk.Align.FILL,
+        });
+        newTabButton.connect('clicked', () => {
+            this.newTab();
+            popover.popdown();
+        });
+        box.append(newTabButton);
+
+        const newPageButton = new Gtk.Button({
+            label: 'New Page',
+            halign: Gtk.Align.FILL,
+        });
+        newPageButton.connect('clicked', () => {
+            popover.popdown();
+            const win = new EditorWindow(this.get_application());
+            win.present();
+        });
+        box.append(newPageButton);
+
+        return popover;
+    }
+
     _buildSavePopover() {
         const popover = new Gtk.Popover();
         const box = new Gtk.Box({
@@ -1861,6 +2044,7 @@ class EditorWindow extends Gtk.ApplicationWindow {
         this._addAction('new-tab', () => this.newTab());
         this._addAction('open', () => this.openDialog());
         this._addAction('open-folder', () => this.openFolderDialog());
+        this._addAction('quick-open', () => this.openQuickFinder());
         this._addAction('connect-ssh', () => this.openSshDialog());
         this._addAction('save', () => this.save());
         this._addAction('save-as', () => this.saveAsDialog());
@@ -1869,6 +2053,7 @@ class EditorWindow extends Gtk.ApplicationWindow {
         this._addAction('previous-tab', () => this.selectPreviousTab());
         this._addAction('toggle-explorer', () => this._toggleExplorer());
         this._addAction('toggle-console', () => this._toggleConsole());
+        this._addAction('toggle-terminal', () => this._toggleTerminal());
         this._addAction('toggle-preview', () => {
             if (this._previewButton)
                 this._previewButton.active = !this._previewButton.active;
@@ -1878,9 +2063,10 @@ class EditorWindow extends Gtk.ApplicationWindow {
         this._addAction('quit', () => this.close());
 
         const app = this.get_application();
-        app.set_accels_for_action('win.new-tab', ['<Primary>n']);
+        app.set_accels_for_action('win.new-tab', ['<Primary>n', '<Primary>t']);
         app.set_accels_for_action('win.open', ['<Primary>o']);
         app.set_accels_for_action('win.open-folder', ['<Primary><Shift>o']);
+        app.set_accels_for_action('win.quick-open', ['<Primary>p']);
         app.set_accels_for_action('win.connect-ssh', ['<Primary><Shift>k']);
         app.set_accels_for_action('win.save', ['<Primary>s']);
         app.set_accels_for_action('win.save-as', ['<Primary><Shift>s']);
@@ -1889,6 +2075,7 @@ class EditorWindow extends Gtk.ApplicationWindow {
         app.set_accels_for_action('win.previous-tab', ['<Primary>Page_Up']);
         app.set_accels_for_action('win.toggle-explorer', ['<Primary><Shift>e']);
         app.set_accels_for_action('win.toggle-console', ['<Primary><Shift>j']);
+        app.set_accels_for_action('win.toggle-terminal', ['<Primary>grave']);
         app.set_accels_for_action('win.toggle-preview', ['<Primary><Shift>p']);
         app.set_accels_for_action('win.toggle-theme', ['<Primary><Shift>t']);
         app.set_accels_for_action('win.custom-theme', ['<Primary><Shift>c']);
@@ -2236,6 +2423,211 @@ class EditorWindow extends Gtk.ApplicationWindow {
             dialog.destroy();
         });
         dialog.show();
+    }
+
+    _collectLocalFiles(dir, results, limit) {
+        if (results.length >= limit)
+            return;
+
+        let enumerator;
+        try {
+            enumerator = dir.enumerate_children(
+                'standard::name,standard::type,standard::is-hidden',
+                Gio.FileQueryInfoFlags.NONE,
+                null
+            );
+        } catch (_error) {
+            return;
+        }
+
+        let info;
+        while (results.length < limit && (info = enumerator.next_file(null)) !== null) {
+            if (info.get_is_hidden())
+                continue;
+
+            const name = info.get_name();
+            if (QUICK_FINDER_SKIP_DIRS.has(name))
+                continue;
+
+            const child = dir.get_child(name);
+            if (info.get_file_type() === Gio.FileType.DIRECTORY)
+                this._collectLocalFiles(child, results, limit);
+            else
+                results.push(child);
+        }
+        enumerator.close(null);
+    }
+
+    openQuickFinder() {
+        const dialog = new Gtk.Window({
+            title: 'Quick Open',
+            transient_for: this,
+            modal: true,
+            default_width: 560,
+            default_height: 420,
+        });
+
+        const box = new Gtk.Box({
+            orientation: Gtk.Orientation.VERTICAL,
+            spacing: 0,
+            margin_top: 8,
+            margin_bottom: 8,
+            margin_start: 8,
+            margin_end: 8,
+        });
+        dialog.set_child(box);
+
+        const entry = new Gtk.Entry({
+            placeholder_text: 'Type to fuzzy-search files...',
+            hexpand: true,
+        });
+        box.append(entry);
+
+        const list = new Gtk.ListBox({
+            selection_mode: Gtk.SelectionMode.BROWSE,
+        });
+        list.add_css_class('quick-finder-list');
+        const scroller = new Gtk.ScrolledWindow({
+            hexpand: true,
+            vexpand: true,
+            margin_top: 8,
+            child: list,
+        });
+        box.append(scroller);
+
+        const statusLabel = new Gtk.Label({
+            label: 'Indexing files...',
+            xalign: 0,
+            margin_top: 6,
+        });
+        statusLabel.add_css_class('path-label');
+        box.append(statusLabel);
+
+        let allEntries = [];
+        let closed = false;
+
+        const openItem = item => {
+            if (!item)
+                return;
+            closed = true;
+            dialog.destroy();
+            item.open();
+        };
+
+        const applyFilter = () => {
+            const query = entry.text.trim();
+            while (list.get_first_child())
+                list.remove(list.get_first_child());
+
+            let matches;
+            if (!query) {
+                matches = allEntries.slice(0, QUICK_FINDER_MAX_RESULTS);
+            } else {
+                matches = allEntries
+                    .map(item => ({item, score: fuzzyScore(query, item.label)}))
+                    .filter(m => m.score !== null)
+                    .sort((a, b) => b.score - a.score)
+                    .slice(0, QUICK_FINDER_MAX_RESULTS)
+                    .map(m => m.item);
+            }
+
+            for (const item of matches) {
+                const row = new Gtk.ListBoxRow();
+                const label = new Gtk.Label({
+                    label: item.label,
+                    xalign: 0,
+                    margin_top: 4,
+                    margin_bottom: 4,
+                    margin_start: 8,
+                    margin_end: 8,
+                    ellipsize: 3,
+                });
+                row.set_child(label);
+                row._nceQuickItem = item;
+                list.append(row);
+            }
+
+            const first = list.get_row_at_index(0);
+            if (first)
+                list.select_row(first);
+
+            statusLabel.label = query
+                ? `${matches.length} match${matches.length === 1 ? '' : 'es'}`
+                : `${allEntries.length} files`;
+        };
+
+        entry.connect('changed', applyFilter);
+        entry.connect('activate', () => {
+            const selected = list.get_selected_row();
+            openItem(selected ? selected._nceQuickItem : null);
+        });
+        list.connect('row-activated', (_list, row) => openItem(row._nceQuickItem));
+
+        const keyController = new Gtk.EventControllerKey();
+        keyController.connect('key-pressed', (_controller, keyval) => {
+            if (keyval === Gdk.KEY_Escape) {
+                closed = true;
+                dialog.destroy();
+                return true;
+            }
+            if (keyval === Gdk.KEY_Down || keyval === Gdk.KEY_Up) {
+                const current = list.get_selected_row();
+                const index = current ? current.get_index() : -1;
+                const nextIndex = keyval === Gdk.KEY_Down ? index + 1 : Math.max(0, index - 1);
+                const nextRow = list.get_row_at_index(nextIndex);
+                if (nextRow)
+                    list.select_row(nextRow);
+                return true;
+            }
+            return false;
+        });
+        entry.add_controller(keyController);
+
+        dialog.present();
+        entry.grab_focus();
+
+        if (this._remote) {
+            statusLabel.label = `Indexing ${this._remote.target}...`;
+            const remote = this._remote;
+            const baseDir = this._remoteDir;
+            this._runRemoteCommandAsync(
+                'find . -maxdepth 12 -type f 2>/dev/null | LC_ALL=C sort | head -n 4000',
+                baseDir,
+                remote,
+                null,
+                (ok, stdout, stderr, status) => {
+                    if (closed)
+                        return;
+                    if (!ok || status !== 0) {
+                        statusLabel.label = `Index failed: ${stderr.trim() || `exit ${status}`}`;
+                        return;
+                    }
+                    allEntries = stdout.split('\n')
+                        .map(line => line.trim())
+                        .filter(Boolean)
+                        .map(rel => {
+                            const cleanRel = rel.replace(/^\.\//, '');
+                            const fullPath = pathJoin(baseDir, cleanRel);
+                            return {
+                                label: cleanRel,
+                                open: () => this.loadRemoteFile(fullPath),
+                            };
+                        });
+                    applyFilter();
+                }
+            );
+        } else {
+            const files = [];
+            this._collectLocalFiles(this._workspaceDir, files, QUICK_FINDER_MAX_FILES);
+            allEntries = files.map(file => {
+                const rel = this._workspaceDir.get_relative_path(file) || file.get_basename();
+                return {
+                    label: rel,
+                    open: () => this.loadFile(file),
+                };
+            });
+            applyFilter();
+        }
     }
 
     openSshDialog() {
