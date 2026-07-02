@@ -444,28 +444,21 @@ class EditorWindow extends Gtk.ApplicationWindow {
         });
         header.pack_start(saveButton);
 
-        const sshButton = new Gtk.Button({
-            icon_name: 'network-server-symbolic',
-            tooltip_text: 'Connect over SSH',
-        });
-        sshButton.connect('clicked', () => this.openSshDialog());
-        header.pack_start(sshButton);
-
         this._consoleButton = new Gtk.ToggleButton({
-            icon_name: 'applications-utilities-symbolic',
-            tooltip_text: 'Toggle Console',
+            icon_name: 'utilities-terminal-symbolic',
+            tooltip_text: 'Toggle Console/Terminal',
         });
         this._consoleButton.connect('toggled', () => {
             this._setConsoleVisible(this._consoleButton.active, false);
         });
         header.pack_end(this._consoleButton);
 
-        const terminalButton = new Gtk.Button({
-            icon_name: 'utilities-terminal-symbolic',
-            tooltip_text: 'Toggle Terminal (Ctrl+`)',
+        const sshButton = new Gtk.Button({
+            icon_name: 'network-server-symbolic',
+            tooltip_text: 'Connect over SSH',
         });
-        terminalButton.connect('clicked', () => this._toggleTerminal());
-        header.pack_end(terminalButton);
+        sshButton.connect('clicked', () => this.openSshDialog());
+        header.pack_end(sshButton);
 
         this._busySpinner = new Gtk.Spinner({
             visible: false,
@@ -1220,17 +1213,17 @@ class EditorWindow extends Gtk.ApplicationWindow {
         if (syncButton && this._consoleButton)
             this._consoleButton.active = visible;
 
-        if (visible && this._bottomNotebook)
-            this._bottomNotebook.set_current_page(0);
-
-        if (visible && this._consoleEntry)
+        if (visible && this._bottomNotebook && this._bottomNotebook.get_current_page() === 0 && this._consoleEntry)
             this._consoleEntry.grab_focus();
 
-        this._setStatus(visible ? 'Console shown' : 'Console hidden');
+        this._setStatus(visible ? 'Console/Terminal shown' : 'Console/Terminal hidden');
     }
 
     _toggleConsole() {
-        this._setConsoleVisible(!this._consolePanel.visible);
+        const showing = !this._consolePanel.visible;
+        if (showing && this._bottomNotebook)
+            this._bottomNotebook.set_current_page(0);
+        this._setConsoleVisible(showing);
     }
 
     _setWorkspaceDir(file) {
