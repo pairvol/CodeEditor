@@ -371,26 +371,13 @@ class EditorWindow extends Gtk.ApplicationWindow {
         });
         header.pack_start(newTabButton);
 
-        const openButton = new Gtk.Button({
+        this._openPopover = this._buildOpenPopover();
+        const openButton = new Gtk.MenuButton({
             icon_name: 'document-open-symbolic',
             tooltip_text: 'Open',
+            popover: this._openPopover,
         });
-        openButton.connect('clicked', () => this.openDialog());
         header.pack_start(openButton);
-
-        const openFolderButton = new Gtk.Button({
-            icon_name: 'folder-symbolic',
-            tooltip_text: 'Open Folder',
-        });
-        openFolderButton.connect('clicked', () => this.openFolderDialog());
-        header.pack_start(openFolderButton);
-
-        const quickOpenButton = new Gtk.Button({
-            icon_name: 'system-search-symbolic',
-            tooltip_text: 'Quick Open (Ctrl+P)',
-        });
-        quickOpenButton.connect('clicked', () => this.openQuickFinder());
-        header.pack_start(quickOpenButton);
 
         this._explorerButton = new Gtk.ToggleButton({
             icon_name: 'sidebar-show-symbolic',
@@ -1973,6 +1960,51 @@ class EditorWindow extends Gtk.ApplicationWindow {
             win.present();
         });
         box.append(newPageButton);
+
+        return popover;
+    }
+
+    _buildOpenPopover() {
+        const popover = new Gtk.Popover();
+        const box = new Gtk.Box({
+            orientation: Gtk.Orientation.VERTICAL,
+            spacing: 4,
+            margin_top: 8,
+            margin_bottom: 8,
+            margin_start: 8,
+            margin_end: 8,
+        });
+        popover.set_child(box);
+
+        const openFileButton = new Gtk.Button({
+            label: 'Open File',
+            halign: Gtk.Align.FILL,
+        });
+        openFileButton.connect('clicked', () => {
+            popover.popdown();
+            this.openDialog();
+        });
+        box.append(openFileButton);
+
+        const openFolderButton = new Gtk.Button({
+            label: 'Open Folder',
+            halign: Gtk.Align.FILL,
+        });
+        openFolderButton.connect('clicked', () => {
+            popover.popdown();
+            this.openFolderDialog();
+        });
+        box.append(openFolderButton);
+
+        const openSearchButton = new Gtk.Button({
+            label: 'Open Search',
+            halign: Gtk.Align.FILL,
+        });
+        openSearchButton.connect('clicked', () => {
+            popover.popdown();
+            this.openQuickFinder();
+        });
+        box.append(openSearchButton);
 
         return popover;
     }
