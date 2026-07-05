@@ -2,6 +2,7 @@
 Type=Application
 Name=Native Code Editor
 Comment=Native Linux text editor
+Icon=dev.pairvol.NativeCodeEditor
 Exec=nce-gui %F
 Terminal=false
 Categories=Utility;TextEditor;
